@@ -9,6 +9,11 @@ var CALENDAR_ID = 'c16cb7e33da24f0de52777487619b3ec0f91d88acf84d6dc96b7f482590d8
 var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
 var REPORT_SHEET_NAME = 'Run_Report';
 
+// Timezone: set Apps Script project timezone to match your spreadsheet so event dates/times are correct.
+// In the script editor: File > Project properties > Script timezone (e.g. Europe/Warsaw).
+// (Used for reference; event times are built using the script timezone.)
+var TIMEZONE = 'Europe/Warsaw';
+
 // Behavior toggles
 var PHASE1_ONLY = false; // true = validation + reporting only, no calendar changes
 var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = true; // BEH-11 default
@@ -544,6 +549,13 @@ function toAppsScriptWeekday(token) {
   }
 }
 
+// Returns end-of-day for recurrence "until" so the last date is included (not cut off at midnight).
+function getRecurrenceUntilEndOfDay(date) {
+  var d = new Date(date.getTime());
+  d.setHours(23, 59, 59, 999);
+  return d;
+}
+
 function createSeries(calendar, bucket, emails, description, reportEntries) {
   var schedule = bucket.schedule;
   var primarySlot = schedule.slots[0];
@@ -554,7 +566,7 @@ function createSeries(calendar, bucket, emails, description, reportEntries) {
 
   var recurrence = CalendarApp.newRecurrence()
     .addWeeklyRule()
-    .until(schedule.endDate);
+    .until(getRecurrenceUntilEndOfDay(schedule.endDate));
 
   // Add all weekdays in slots
   schedule.slots.forEach(function(s) {
@@ -589,7 +601,7 @@ function updateSeries(calendar, series, bucket, emails, description, reportEntri
   var end = new Date(start.getTime() + 60 * 60 * 1000);
   var recurrence = CalendarApp.newRecurrence()
     .addWeeklyRule()
-    .until(schedule.endDate);
+    .until(getRecurrenceUntilEndOfDay(schedule.endDate));
 
   schedule.slots.forEach(function(s) {
     recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
