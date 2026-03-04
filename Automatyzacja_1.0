@@ -1,0 +1,721 @@
+/******************************
+ * CONFIG
+ ******************************/
+
+// Calendar id from the spec
+var CALENDAR_ID = 'c16cb7e33da24f0de52777487619b3ec0f91d88acf84d6dc96b7f482590d808f@group.calendar.google.com';
+
+// Sheet and tab names
+var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
+var REPORT_SHEET_NAME = 'Run_Report';
+
+// Behavior toggles
+var PHASE1_ONLY = false; // true = validation + reporting only, no calendar changes
+var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = true; // BEH-11 default
+
+/******************************
+ * ENTRYPOINT
+ ******************************/
+
+function runSync() {
+  var now = new Date();
+  var reportEntries = [];
+
+  try {
+    var ss = SpreadsheetApp.getActive();
+    var scheduleSheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+    if (!scheduleSheet) {
+      throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
+    }
+
+    var rawRows = readScheduleRows(scheduleSheet);
+    var validation = validateAndGroup(rawRows, reportEntries);
+
+    // Phase 1: malformed rows + conflicts already logged into reportEntries
+    if (PHASE1_ONLY) {
+      writeRunReport(ss, reportEntries);
+      return;
+    }
+
+    // Phase 2/3/4: calendar operations + more report entries
+    var calendar = CalendarApp.getCalendarById(CALENDAR_ID);
+    if (!calendar) {
+      throw new Error('Calendar with id ' + CALENDAR_ID + ' not found or not accessible');
+    }
+
+    upsertEventsForGroups(calendar, validation, reportEntries);
+
+    // Finally write the run report
+    writeRunReport(ss, reportEntries);
+  } catch (e) {
+    reportEntries.push(makeReportEntry({
+      action: 'API_FAILURE',
+      errorReason: String(e),
+      details: 'Fatal error in runSync'
+    }));
+    var ss2 = SpreadsheetApp.getActive();
+    if (ss2) {
+      writeRunReport(ss2, reportEntries);
+    }
+    Logger.log('Fatal error: ' + e.stack);
+  }
+}
+
+/******************************
+ * DATA MODELS (conceptual)
+ ******************************/
+
+// RawRow: { rowIndex: number, values: { headerName: any } }
+// ValidatedRow, GroupBucket modeled as plain JS objects
+
+/******************************
+ * CONSTANTS FOR HEADERS
+ ******************************/
+
+var HEADER_EMAIL = 'Uczestnik (Email)';
+var HEADER_GROUP = 'Nazwa Grupy';
+var HEADER_START_DATE = 'Data startu';
+var HEADER_END_DATE = 'Data końca';
+var HEADER_DAY1 = 'Dzień #1';
+var HEADER_TIME1 = 'Godzina #1 (hh:mm)';
+var HEADER_DAY2 = 'Dzień #2';
+var HEADER_TIME2 = 'Godzina #2 (hh:mm)';
+var HEADER_CONFIRMED = 'Confirmed';
+var HEADER_TRIAL_DATE = 'Data zajęć próbnych';
+var HEADER_ZOOM = 'Zoom link';
+var HEADER_TEACHER = 'Nauczyciel';
+var HEADER_DROPBOX = 'Link do dropbox';
+var HEADER_MIRO = 'Link do Miro';
+
+/******************************
+ * READING + VALIDATION (Phase 1)
+ ******************************/
+
+function readScheduleRows(sheet) {
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  var headerRow = values[0];
+  var dataRows = values.slice(1);
+
+  var headers = headerRow.map(String);
+  var result = [];
+
+  for (var i = 0; i < dataRows.length; i++) {
+    var rowVals = dataRows[i];
+    var map = {};
+    for (var c = 0; c < headers.length; c++) {
+      map[headers[c]] = rowVals[c];
+    }
+    result.push({
+      rowIndex: i + 2, // 1-based, +1 for header row
+      values: map
+    });
+  }
+  return result;
+}
+
+function validateAndGroup(rawRows, reportEntries) {
+  var validRows = [];
+  var malformedRows = [];
+  var conflicts = [];
+
+  for (var i = 0; i < rawRows.length; i++) {
+    var raw = rawRows[i];
+    var res = validateRow(raw);
+    if (res.isError) {
+      malformedRows.push(res.error);
+    } else {
+      validRows.push(res.value);
+    }
+  }
+
+  // Group valid rows by groupName
+  var groupsByName = {};
+  validRows.forEach(function(r) {
+    if (!groupsByName[r.groupName]) groupsByName[r.groupName] = [];
+    groupsByName[r.groupName].push(r);
+  });
+
+  var validGroups = [];
+
+  Object.keys(groupsByName).forEach(function(groupName) {
+    var rows = groupsByName[groupName];
+    var first = rows[0];
+    var canonicalSchedule = buildGroupSchedule(first);
+
+    var conflictingIndices = [];
+    for (var j = 1; j < rows.length; j++) {
+      if (!schedulesMatch(canonicalSchedule, rows[j])) {
+        conflictingIndices.push(rows[j].rowIndex);
+      }
+    }
+
+    if (conflictingIndices.length > 0) {
+      conflicts.push({
+        groupName: groupName,
+        rowIndices: [first.rowIndex].concat(conflictingIndices),
+        reason: 'Conflicting schedule-defining fields within group'
+      });
+    } else {
+      validGroups.push({
+        groupName: groupName,
+        rows: rows,
+        schedule: canonicalSchedule
+      });
+    }
+  });
+
+  // Log malformed rows
+  malformedRows.forEach(function(m) {
+    reportEntries.push(makeReportEntry({
+      action: 'ROW_MALFORMED',
+      rowIndex: m.rowIndex,
+      groupName: m.groupName,
+      errorReason: m.reason
+    }));
+  });
+
+  // Log conflicts
+  conflicts.forEach(function(c) {
+    reportEntries.push(makeReportEntry({
+      action: 'GROUP_CONFLICT',
+      groupName: c.groupName,
+      details: 'Rows: ' + c.rowIndices.join(', '),
+      errorReason: c.reason
+    }));
+  });
+
+  return {
+    validGroups: validGroups,
+    conflictingGroups: conflicts,
+    malformedRows: malformedRows
+  };
+}
+
+function validateRow(raw) {
+  var v = function(h) { return raw.values[h]; };
+
+  var emailRaw = v(HEADER_EMAIL);
+  var groupRaw = v(HEADER_GROUP);
+  var startRaw = v(HEADER_START_DATE);
+  var endRaw = v(HEADER_END_DATE);
+  var day1Raw = v(HEADER_DAY1);
+  var time1Raw = v(HEADER_TIME1);
+
+  var missing = [];
+  if (!emailRaw) missing.push(HEADER_EMAIL);
+  if (!groupRaw) missing.push(HEADER_GROUP);
+  if (!startRaw) missing.push(HEADER_START_DATE);
+  if (!endRaw) missing.push(HEADER_END_DATE);
+  if (!day1Raw) missing.push(HEADER_DAY1);
+  if (!time1Raw) missing.push(HEADER_TIME1);
+
+  var groupName = typeof groupRaw === 'string' ? groupRaw.trim() : undefined;
+
+  if (missing.length > 0) {
+    return {
+      isError: true,
+      error: {
+        rowIndex: raw.rowIndex,
+        groupName: groupName,
+        reason: 'Missing required fields: ' + missing.join(', ')
+      }
+    };
+  }
+
+  if (!isValidEmail(emailRaw)) {
+    return {
+      isError: true,
+      error: {
+        rowIndex: raw.rowIndex,
+        groupName: groupName,
+        reason: 'Malformed participant email'
+      }
+    };
+  }
+
+  var startDate = parseDateCell(startRaw);
+  var endDate = parseDateCell(endRaw);
+  if (!startDate || !endDate) {
+    return {
+      isError: true,
+      error: {
+        rowIndex: raw.rowIndex,
+        groupName: groupName,
+        reason: 'Malformed start or end date'
+      }
+    };
+  }
+
+  var day1 = parseWeekdayToken(day1Raw);
+  var time1 = parseTimeOfDay(time1Raw);
+  if (!day1 || !time1) {
+    return {
+      isError: true,
+      error: {
+        rowIndex: raw.rowIndex,
+        groupName: groupName,
+        reason: 'Malformed primary day or time'
+      }
+    };
+  }
+
+  var day2Raw = v(HEADER_DAY2);
+  var time2Raw = v(HEADER_TIME2);
+
+  var day2 = null;
+  var time2 = null;
+
+  var hasDay2 = day2Raw !== null && day2Raw !== '' && day2Raw !== undefined;
+  var hasTime2 = time2Raw !== null && time2Raw !== '' && time2Raw !== undefined;
+
+  if (hasDay2 && hasTime2) {
+    day2 = parseWeekdayToken(day2Raw);
+    time2 = parseTimeOfDay(time2Raw);
+    // Only error if both are present but invalid
+    if (!day2 || !time2) {
+      return {
+        isError: true,
+        error: {
+          rowIndex: raw.rowIndex,
+          groupName: groupName,
+          reason: 'Malformed secondary day or time'
+        }
+      };
+    }
+  } else {
+    // One or both are empty → treat as “no second slot” (per BEH-03), no error
+    day2 = null;
+    time2 = null;
+  }
+
+  var trialRaw = v(HEADER_TRIAL_DATE);
+  var trialDate = null;
+  if (trialRaw !== null && trialRaw !== '' && trialRaw !== undefined) {
+    trialDate = parseDateCell(trialRaw);
+    if (!trialDate) {
+      return {
+        isError: true,
+        error: {
+          rowIndex: raw.rowIndex,
+          groupName: groupName,
+          reason: 'Malformed trial date'
+        }
+      };
+    }
+  }
+
+  var confirmed = parseBooleanCell(v(HEADER_CONFIRMED));
+
+  var zoomLink = v(HEADER_ZOOM);
+  var teacherName = v(HEADER_TEACHER);
+  var dropboxLink = v(HEADER_DROPBOX);
+  var miroLink = v(HEADER_MIRO);
+
+  return {
+    isError: false,
+    value: {
+      rowIndex: raw.rowIndex,
+      groupName: groupName || '',
+      participantEmail: String(emailRaw).trim(),
+      confirmed: confirmed,
+      zoomLink: typeof zoomLink === 'string' ? zoomLink.trim() : '',
+      teacherName: typeof teacherName === 'string' ? teacherName.trim() : '',
+      dropboxLink: typeof dropboxLink === 'string' ? dropboxLink.trim() : '',
+      miroLink: typeof miroLink === 'string' ? miroLink.trim() : '',
+      startDate: startDate,
+      endDate: endDate,
+      day1: day1,
+      time1: time1,
+      day2: day2,
+      time2: time2,
+      trialDate: trialDate
+    }
+  };
+}
+
+/******************************
+ * PARSERS
+ ******************************/
+
+function parseWeekdayToken(value) {
+  if (typeof value !== 'string') return null;
+  var t = value.trim();
+  if (['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].indexOf(t) !== -1) return t;
+  return null;
+}
+
+function parseTimeOfDay(value) {
+  // If it's a time cell, Apps Script often gives a Date
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    var d = new Date(value.getTime());
+    return {
+      hour: d.getHours(),
+      minute: d.getMinutes()
+    };
+  }
+
+  // Sometimes times are stored as numbers (fraction of a day)
+  if (typeof value === 'number') {
+    var totalMinutes = Math.round(value * 24 * 60);
+    var h = Math.floor(totalMinutes / 60);
+    var mm = totalMinutes % 60;
+    if (h < 0 || h > 23 || mm < 0 || mm > 59) return null;
+    return { hour: h, minute: mm };
+  }
+
+  // Fallback: string in HH:mm
+  if (typeof value === 'string') {
+    var m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+    if (!m) return null;
+    var h2 = Number(m[1]);
+    var mm2 = Number(m[2]);
+    if (isNaN(h2) || isNaN(mm2) || h2 < 0 || h2 > 23 || mm2 < 0 || mm2 > 59) return null;
+    return { hour: h2, minute: mm2 };
+  }
+
+  return null;
+}
+
+function parseDateCell(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return new Date(value.getTime());
+  }
+  if (typeof value === 'string') {
+    var d = new Date(value);
+    if (isNaN(d.getTime())) return null;
+    return d;
+  }
+  return null;
+}
+
+function parseBooleanCell(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    var t = value.trim().toLowerCase();
+    return t === 'true' || t === 'yes' || t === '1';
+  }
+  if (typeof value === 'number') return value !== 0;
+  return false;
+}
+
+function isValidEmail(value) {
+  if (typeof value !== 'string') return false;
+  var s = value.trim();
+  var re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return re.test(s);
+}
+
+/******************************
+ * GROUP SCHEDULE COMPARISON
+ ******************************/
+
+function buildGroupSchedule(row) {
+  var slots = [{
+    weekday: row.day1,
+    time: row.time1
+  }];
+  if (row.day2 && row.time2) {
+    slots.push({
+      weekday: row.day2,
+      time: row.time2
+    });
+  }
+  return {
+    startDate: row.startDate,
+    endDate: row.endDate,
+    slots: slots
+  };
+}
+
+function schedulesMatch(schedule, row) {
+  var other = buildGroupSchedule(row);
+  if (schedule.startDate.getTime() !== other.startDate.getTime()) return false;
+  if (schedule.endDate.getTime() !== other.endDate.getTime()) return false;
+  if (schedule.slots.length !== other.slots.length) return false;
+  for (var i = 0; i < schedule.slots.length; i++) {
+    var a = schedule.slots[i];
+    var b = other.slots[i];
+    if (a.weekday !== b.weekday) return false;
+    if (a.time.hour !== b.time.hour || a.time.minute !== b.time.minute) return false;
+  }
+  return true;
+}
+
+/******************************
+ * TEMPLATE RENDERING (Phase 3)
+ ******************************/
+
+var RAW_TEMPLATE = '' +
+'Pay attention that all lessons are conducted in zoom\n' +
+'{{zoom link}}\n\n' +
+'Your teacher\'s name is {{Nauczyciel}}.\n' +
+'All lessons are recorded so you can rewatch them to review the material or in case you skipped one.\n\n' +
+'You can watch them here\n' +
+'{{to ma hyperlink do Dropbox}}\n\n' +
+'You will work with the miro board Classroom board\n' +
+'{link do Miro}';
+
+function renderInvitationBody(row) {
+  var body = RAW_TEMPLATE;
+
+  body = body.replace('{{zoom link}}', row.zoomLink || '');
+  body = body.replace('{{Nauczyciel}}', row.teacherName || '');
+
+  var dropbox = row.dropboxLink || '';
+  var hyperlink = '<a href="' + dropbox + '">You can watch them here</a>';
+  body = body.replace('{{to ma hyperlink do Dropbox}}', hyperlink);
+
+  body = body.replace('{link do Miro}', row.miroLink || '');
+
+  return body;
+}
+
+/******************************
+ * CALENDAR OPERATIONS (Phase 2)
+ ******************************/
+
+function upsertEventsForGroups(calendar, validation, reportEntries) {
+  validation.validGroups.forEach(function(bucket) {
+    var parts = partitionParticipants(bucket);
+    var seriesParticipants = parts.seriesParticipants;
+    var trialParticipants = parts.trialParticipants;
+
+    var seriesEmails = seriesParticipants.map(function(r) { return r.participantEmail; });
+    var canonicalRow = seriesParticipants[0] || bucket.rows[0];
+    var description = renderInvitationBody(canonicalRow);
+
+    // BEH-11 config
+    if (seriesEmails.length === 0 && !CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES) {
+      reportEntries.push(makeReportEntry({
+        action: 'GROUP_SKIPPED_NO_ATTENDEES',
+        groupName: bucket.groupName,
+        details: 'Group has no confirmed non-trial participants'
+      }));
+    } else {
+      var existingSeries = findExistingGroupSeries(calendar, bucket);
+      if (existingSeries) {
+        updateSeries(calendar, existingSeries, bucket, seriesEmails, description, reportEntries);
+      } else {
+        createSeries(calendar, bucket, seriesEmails, description, reportEntries);
+      }
+    }
+
+    // Trial events
+    trialParticipants.forEach(function(row) {
+      if (!row.trialDate) return;
+      var desc = renderInvitationBody(row);
+      createTrialEvent(calendar, bucket, row, desc, reportEntries);
+    });
+  });
+}
+
+function partitionParticipants(bucket) {
+  var series = [];
+  var trials = [];
+
+  bucket.rows.forEach(function(row) {
+    var hasTrial = row.trialDate &&
+      row.trialDate.getTime() >= bucket.schedule.startDate.getTime() &&
+      row.trialDate.getTime() <= bucket.schedule.endDate.getTime();
+
+    if (hasTrial) {
+      trials.push(row);
+    } else if (row.confirmed) {
+      series.push(row);
+    }
+  });
+
+  return {
+    seriesParticipants: series,
+    trialParticipants: trials
+  };
+}
+
+function toAppsScriptWeekday(token) {
+  switch (token) {
+    case 'Mon': return CalendarApp.Weekday.MONDAY;
+    case 'Tue': return CalendarApp.Weekday.TUESDAY;
+    case 'Wed': return CalendarApp.Weekday.WEDNESDAY;
+    case 'Thu': return CalendarApp.Weekday.THURSDAY;
+    case 'Fri': return CalendarApp.Weekday.FRIDAY;
+    default: throw new Error('Unsupported weekday token: ' + token);
+  }
+}
+
+function createSeries(calendar, bucket, emails, description, reportEntries) {
+  var schedule = bucket.schedule;
+  var primarySlot = schedule.slots[0];
+
+  var start = new Date(schedule.startDate.getTime());
+  start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
+  var end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
+
+  var recurrence = CalendarApp.newRecurrence()
+    .addWeeklyRule()
+    .until(schedule.endDate);
+
+  // Add all weekdays in slots
+  schedule.slots.forEach(function(s) {
+    recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
+  });
+
+  var eventSeries = calendar.createEventSeries(bucket.groupName, start, end, recurrence, {
+    description: description
+  });
+
+  // Add attendees
+  emails.forEach(function(email) {
+    eventSeries.addGuest(email);
+  });
+
+  reportEntries.push(makeReportEntry({
+    action: 'EVENT_CREATED',
+    groupName: bucket.groupName,
+    details: 'Created recurring event; attendees: ' + emails.length
+  }));
+}
+
+function updateSeries(calendar, series, bucket, emails, description, reportEntries) {
+  // Update description always (idempotent enough)
+  series.setDescription(description);
+
+  // Update recurrence if schedule changed: for simplicity, we always reset
+  var schedule = bucket.schedule;
+  var primarySlot = schedule.slots[0];
+  var start = new Date(schedule.startDate.getTime());
+  start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
+  var end = new Date(start.getTime() + 60 * 60 * 1000);
+  var recurrence = CalendarApp.newRecurrence()
+    .addWeeklyRule()
+    .until(schedule.endDate);
+
+  schedule.slots.forEach(function(s) {
+    recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
+  });
+
+  series.setTime(start, end);
+  series.setRecurrence(recurrence);
+
+  // Update guests
+  var currentGuests = series.getGuestList().map(function(g) { return g.getEmail(); });
+  var desired = {};
+  emails.forEach(function(e) { desired[e] = true; });
+
+  // Remove no-longer-confirmed
+  currentGuests.forEach(function(email) {
+    if (!desired[email]) {
+      series.removeGuest(email);
+    }
+  });
+
+  // Add newly confirmed
+  emails.forEach(function(email) {
+    if (currentGuests.indexOf(email) === -1) {
+      series.addGuest(email);
+    }
+  });
+
+  reportEntries.push(makeReportEntry({
+    action: 'EVENT_UPDATED',
+    groupName: bucket.groupName,
+    details: 'Updated recurring event; attendees: ' + emails.length
+  }));
+}
+
+function findExistingGroupSeries(calendar, bucket) {
+  // Approximate: find recurring events with matching title whose first occurrence
+  // falls within the group date range.
+  var startWindow = new Date(bucket.schedule.startDate.getTime());
+  startWindow.setDate(startWindow.getDate() - 7);
+  var endWindow = new Date(bucket.schedule.endDate.getTime());
+  endWindow.setDate(endWindow.getDate() + 7);
+
+  var events = calendar.getEvents(startWindow, endWindow);
+  for (var i = 0; i < events.length; i++) {
+    var e = events[i];
+    if (!e.isRecurringEvent()) continue;
+    if (e.getTitle() !== bucket.groupName) continue;
+
+    var eStart = e.getStartTime();
+    if (eStart >= bucket.schedule.startDate && eStart <= bucket.schedule.endDate) {
+      return e.getEventSeries();
+    }
+  }
+  return null;
+}
+
+function createTrialEvent(calendar, bucket, row, description, reportEntries) {
+  var schedule = bucket.schedule;
+  var primarySlot = schedule.slots[0];
+  var start = new Date(row.trialDate.getTime());
+  start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
+  var end = new Date(start.getTime() + 60 * 60 * 1000);
+
+  var event = calendar.createEvent(bucket.groupName, start, end, {
+    description: description
+  });
+  event.addGuest(row.participantEmail);
+
+  reportEntries.push(makeReportEntry({
+    action: 'TRIAL_EVENT_CREATED',
+    groupName: bucket.groupName,
+    rowIndex: row.rowIndex,
+    details: 'Created trial event for ' + row.participantEmail +
+      ' on ' + row.trialDate.toISOString()
+  }));
+}
+
+/******************************
+ * RUN REPORT (Phase 1 & 4)
+ ******************************/
+
+function makeReportEntry(fields) {
+  return {
+    timestamp: new Date(),
+    rowIndex: fields.rowIndex || '',
+    groupName: fields.groupName || '',
+    action: fields.action || '',
+    details: fields.details || '',
+    errorReason: fields.errorReason || ''
+  };
+}
+
+function writeRunReport(ss, entries) {
+  var sheet = ss.getSheetByName(REPORT_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(REPORT_SHEET_NAME);
+  }
+
+  sheet.clearContents();
+
+  var header = ['Timestamp', 'RowIndex', 'GroupName', 'Action', 'Details', 'ErrorReason'];
+  var rows = [header];
+
+  entries.forEach(function(e) {
+    rows.push([
+      e.timestamp,
+      e.rowIndex,
+      e.groupName,
+      e.action,
+      e.details,
+      e.errorReason
+    ]);
+  });
+
+  var range = sheet.getRange(1, 1, rows.length, header.length);
+  range.setValues(rows);
+}
+
+/******************************
+ * OPTIONAL: MENU
+ ******************************/
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Schedule Sync')
+    .addItem('Run sync now', 'runSync')
+    .addToUi();
+}
+
