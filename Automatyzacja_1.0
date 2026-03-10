@@ -9,11 +9,6 @@ var CALENDAR_ID = 'c16cb7e33da24f0de52777487619b3ec0f91d88acf84d6dc96b7f482590d8
 var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
 var REPORT_SHEET_NAME = 'Run_Report';
 
-// Timezone: set Apps Script project timezone to match your spreadsheet so event dates/times are correct.
-// In the script editor: File > Project properties > Script timezone (e.g. Europe/Warsaw).
-// (Used for reference; event times are built using the script timezone.)
-var TIMEZONE = 'Europe/Warsaw';
-
 // Behavior toggles
 var PHASE1_ONLY = false; // true = validation + reporting only, no calendar changes
 var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = true; // BEH-11 default
@@ -549,10 +544,25 @@ function toAppsScriptWeekday(token) {
   }
 }
 
-// Returns end-of-day for recurrence "until" so the last date is included (not cut off at midnight).
-function getRecurrenceUntilEndOfDay(date) {
-  var d = new Date(date.getTime());
-  d.setHours(23, 59, 59, 999);
+function jsWeekdayFromToken(token) {
+  // JS getDay(): Sun=0, Mon=1, ... Sat=6
+  switch (token) {
+    case 'Mon': return 1;
+    case 'Tue': return 2;
+    case 'Wed': return 3;
+    case 'Thu': return 4;
+    case 'Fri': return 5;
+    default:
+      throw new Error('Unsupported weekday token for alignment: ' + token);
+  }
+}
+
+function alignDateToWeekday(baseDate, weekdayToken) {
+  var targetDow = jsWeekdayFromToken(weekdayToken);
+  var d = new Date(baseDate.getTime());
+  var currentDow = d.getDay(); // 0–6
+  var delta = (targetDow - currentDow + 7) % 7; // 0–6 days forward
+  d.setDate(d.getDate() + delta);
   return d;
 }
 
@@ -560,13 +570,14 @@ function createSeries(calendar, bucket, emails, description, reportEntries) {
   var schedule = bucket.schedule;
   var primarySlot = schedule.slots[0];
 
-  var start = new Date(schedule.startDate.getTime());
+  var alignedStartDate = alignDateToWeekday(schedule.startDate, primarySlot.weekday);
+  var start = new Date(alignedStartDate.getTime());
   start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
   var end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
   var recurrence = CalendarApp.newRecurrence()
     .addWeeklyRule()
-    .until(getRecurrenceUntilEndOfDay(schedule.endDate));
+    .until(schedule.endDate);
 
   // Add all weekdays in slots
   schedule.slots.forEach(function(s) {
@@ -596,12 +607,13 @@ function updateSeries(calendar, series, bucket, emails, description, reportEntri
   // Update recurrence if schedule changed: for simplicity, we always reset
   var schedule = bucket.schedule;
   var primarySlot = schedule.slots[0];
-  var start = new Date(schedule.startDate.getTime());
+  var alignedStartDate = alignDateToWeekday(schedule.startDate, primarySlot.weekday);
+  var start = new Date(alignedStartDate.getTime());
   start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
   var end = new Date(start.getTime() + 60 * 60 * 1000);
   var recurrence = CalendarApp.newRecurrence()
     .addWeeklyRule()
-    .until(getRecurrenceUntilEndOfDay(schedule.endDate));
+    .until(schedule.endDate);
 
   schedule.slots.forEach(function(s) {
     recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
