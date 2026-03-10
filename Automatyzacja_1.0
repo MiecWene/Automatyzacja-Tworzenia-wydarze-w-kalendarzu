@@ -13,6 +13,10 @@ var REPORT_SHEET_NAME = 'Run_Report';
 var PHASE1_ONLY = false; // true = validation + reporting only, no calendar changes
 var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = true; // BEH-11 default
 
+// Retry for transient Calendar API errors (e.g. "Service unavailable: Calendar")
+var CALENDAR_RETRY_ATTEMPTS = 3;
+var CALENDAR_RETRY_DELAY_MS = 2500;
+
 /******************************
  * ENTRYPOINT
  ******************************/
@@ -390,6 +394,19 @@ function parseDateCell(value) {
   return null;
 }
 
+function endOfDay(date) {
+  var d = new Date(date.getTime());
+  d.setHours(23, 59, 59, 999);
+  return d;
+}
+
+function startOfNextDay(date) {
+  var d = new Date(date.getTime());
+  d.setDate(d.getDate() + 1);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
 function parseBooleanCell(value) {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'string') {
@@ -475,6 +492,28 @@ function renderInvitationBody(row) {
 /******************************
  * CALENDAR OPERATIONS (Phase 2)
  ******************************/
+
+/**
+ * Runs fn(); on "Service unavailable" or Calendar-related exception, retries up to
+ * CALENDAR_RETRY_ATTEMPTS with CALENDAR_RETRY_DELAY_MS between attempts.
+ */
+function runWithCalendarRetry(fn) {
+  var lastErr;
+  for (var attempt = 1; attempt <= CALENDAR_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return fn();
+    } catch (e) {
+      lastErr = e;
+      var msg = (e && e.message) ? String(e.message) : String(e);
+      if (attempt < CALENDAR_RETRY_ATTEMPTS && (msg.indexOf('Service unavailable') !== -1 || msg.indexOf('Calendar') !== -1)) {
+        Utilities.sleep(CALENDAR_RETRY_DELAY_MS);
+      } else {
+        throw e;
+      }
+    }
+  }
+  throw lastErr;
+}
 
 function upsertEventsForGroups(calendar, validation, reportEntries) {
   validation.validGroups.forEach(function(bucket) {
@@ -577,20 +616,22 @@ function createSeries(calendar, bucket, emails, description, reportEntries) {
 
   var recurrence = CalendarApp.newRecurrence()
     .addWeeklyRule()
-    .until(schedule.endDate);
+    .until(startOfNextDay(schedule.endDate));
 
   // Add all weekdays in slots
   schedule.slots.forEach(function(s) {
     recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
   });
+  recurrence.setTimeZone(Session.getScriptTimeZone());
 
-  var eventSeries = calendar.createEventSeries(bucket.groupName, start, end, recurrence, {
-    description: description
-  });
-
-  // Add attendees
-  emails.forEach(function(email) {
-    eventSeries.addGuest(email);
+  var eventSeries = runWithCalendarRetry(function() {
+    var series = calendar.createEventSeries(bucket.groupName, start, end, recurrence, {
+      description: description
+    });
+    emails.forEach(function(email) {
+      series.addGuest(email);
+    });
+    return series;
   });
 
   reportEntries.push(makeReportEntry({
@@ -613,32 +654,32 @@ function updateSeries(calendar, series, bucket, emails, description, reportEntri
   var end = new Date(start.getTime() + 60 * 60 * 1000);
   var recurrence = CalendarApp.newRecurrence()
     .addWeeklyRule()
-    .until(schedule.endDate);
+    .until(startOfNextDay(schedule.endDate));
 
   schedule.slots.forEach(function(s) {
     recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
   });
+  recurrence.setTimeZone(Session.getScriptTimeZone());
 
-  series.setTime(start, end);
-  series.setRecurrence(recurrence);
+  runWithCalendarRetry(function() {
+    series.setTime(start, end);
+    series.setRecurrence(recurrence);
 
-  // Update guests
-  var currentGuests = series.getGuestList().map(function(g) { return g.getEmail(); });
-  var desired = {};
-  emails.forEach(function(e) { desired[e] = true; });
+    var currentGuests = series.getGuestList().map(function(g) { return g.getEmail(); });
+    var desired = {};
+    emails.forEach(function(e) { desired[e] = true; });
 
-  // Remove no-longer-confirmed
-  currentGuests.forEach(function(email) {
-    if (!desired[email]) {
-      series.removeGuest(email);
-    }
-  });
+    currentGuests.forEach(function(email) {
+      if (!desired[email]) {
+        series.removeGuest(email);
+      }
+    });
 
-  // Add newly confirmed
-  emails.forEach(function(email) {
-    if (currentGuests.indexOf(email) === -1) {
-      series.addGuest(email);
-    }
+    emails.forEach(function(email) {
+      if (currentGuests.indexOf(email) === -1) {
+        series.addGuest(email);
+      }
+    });
   });
 
   reportEntries.push(makeReportEntry({
@@ -677,10 +718,12 @@ function createTrialEvent(calendar, bucket, row, description, reportEntries) {
   start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
   var end = new Date(start.getTime() + 60 * 60 * 1000);
 
-  var event = calendar.createEvent(bucket.groupName, start, end, {
-    description: description
+  runWithCalendarRetry(function() {
+    var event = calendar.createEvent(bucket.groupName, start, end, {
+      description: description
+    });
+    event.addGuest(row.participantEmail);
   });
-  event.addGuest(row.participantEmail);
 
   reportEntries.push(makeReportEntry({
     action: 'TRIAL_EVENT_CREATED',
