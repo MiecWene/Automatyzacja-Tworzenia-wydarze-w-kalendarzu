@@ -614,18 +614,78 @@ function upsertEventsForGroups(calendar, validation, reportEntries) {
       }
     }
 
-    // Trial participants still attach via Calendar API by groupName and date range
-    if (trialParticipants.length > 0 && primarySeries) {
-      if (!existingSeriesPrimary) {
+    // Trial participants: attach to the correct series (slot) based on the trial date weekday
+    if (trialParticipants.length > 0) {
+      if (primarySeries && !existingSeriesPrimary) {
+        // Give API a moment to index newly created series
         Utilities.sleep(1500);
       }
-      var recurringEventId = getRecurringEventIdByListing(CALENDAR_ID, bucket.groupName, bucket.schedule.startDate, bucket.schedule.endDate);
-      if (recurringEventId) {
-        trialParticipants.forEach(function(row) {
-          if (!row.trialDate) return;
-          addTrialGuestToInstance(CALENDAR_ID, recurringEventId, row.trialDate, row.participantEmail, bucket.schedule, reportEntries, bucket.groupName, row.rowIndex);
-        });
-      }
+
+      trialParticipants.forEach(function(row) {
+        if (!row.trialDate) return;
+        var jsDay = row.trialDate.getDay(); // 0-6
+        var token = jsDayToToken(jsDay);
+        if (!token) {
+          reportEntries.push(makeReportEntry({
+            action: 'TRIAL_SLOT_NOT_FOUND',
+            groupName: bucket.groupName,
+            rowIndex: row.rowIndex,
+            details: 'Trial date weekday not supported for ' + row.participantEmail
+          }));
+          return;
+        }
+
+        // Find matching slot for this weekday
+        var matchingSlot = null;
+        for (var si = 0; si < slots.length; si++) {
+          var s = slots[si];
+          if (s && s.weekday === token) {
+            matchingSlot = s;
+            break;
+          }
+        }
+
+        if (!matchingSlot) {
+          reportEntries.push(makeReportEntry({
+            action: 'TRIAL_SLOT_NOT_FOUND',
+            groupName: bucket.groupName,
+            rowIndex: row.rowIndex,
+            details: 'No slot for weekday ' + token + ' for ' + row.participantEmail
+          }));
+          return;
+        }
+
+        var recurringEventIdForSlot = getRecurringEventIdForSlotByListing(
+          CALENDAR_ID,
+          bucket.groupName,
+          matchingSlot,
+          bucket.schedule.startDate,
+          bucket.schedule.endDate
+        );
+
+        if (!recurringEventIdForSlot) {
+          reportEntries.push(makeReportEntry({
+            action: 'TRIAL_INSTANCE_NOT_FOUND',
+            groupName: bucket.groupName,
+            rowIndex: row.rowIndex,
+            details: 'No recurring series found for weekday ' + token +
+              ' and time ' + matchingSlot.time.hour + ':' + (matchingSlot.time.minute < 10 ? '0' : '') + matchingSlot.time.minute,
+            errorReason: 'No matching recurring series for slot'
+          }));
+          return;
+        }
+
+        addTrialGuestToInstance(
+          CALENDAR_ID,
+          recurringEventIdForSlot,
+          row.trialDate,
+          row.participantEmail,
+          matchingSlot,
+          reportEntries,
+          bucket.groupName,
+          row.rowIndex
+        );
+      });
     }
   });
 }
@@ -673,6 +733,18 @@ function jsWeekdayFromToken(token) {
     case 'Fri': return 5;
     default:
       throw new Error('Unsupported weekday token for alignment: ' + token);
+  }
+}
+
+function jsDayToToken(jsDay) {
+  // JS getDay(): Sun=0, Mon=1, ... Sat=6
+  switch (jsDay) {
+    case 1: return 'Mon';
+    case 2: return 'Tue';
+    case 3: return 'Wed';
+    case 4: return 'Thu';
+    case 5: return 'Fri';
+    default: return null;
   }
 }
 
@@ -828,22 +900,47 @@ function getRecurringEventIdFromSeries(series) {
 }
 
 /**
- * Gets the short recurring event id via Calendar API list (for instances/patch).
- * Calendar API events.instances() requires the event "id", not the iCalUID from CalendarApp.
+ * Gets the short recurring event id for a specific slot via Calendar API list.
+ * Filters by groupName, date window, weekday and time for the slot.
  */
-function getRecurringEventIdByListing(calendarId, groupName, startDate, endDate) {
+function getRecurringEventIdForSlotByListing(calendarId, groupName, slot, startDate, endDate) {
   try {
-    var timeMax = startOfNextDay(endDate).toISOString();
+    var startWindow = new Date(startDate.getTime());
+    startWindow.setDate(startWindow.getDate() - 7);
+    var endWindow = new Date(endDate.getTime());
+    endWindow.setDate(endWindow.getDate() + 7);
+
+    var timeMin = startWindow.toISOString();
+    var timeMax = startOfNextDay(endWindow).toISOString();
+
+    var desiredDow = jsWeekdayFromToken(slot.weekday);
+    var desiredHour = slot.time.hour;
+    var desiredMinute = slot.time.minute;
+
     var response = Calendar.Events.list(calendarId, {
-      timeMin: new Date(startDate.getTime()).toISOString(),
+      timeMin: timeMin,
       timeMax: timeMax,
       singleEvents: false
     });
     var items = response.items || [];
     for (var i = 0; i < items.length; i++) {
-      if (items[i].summary === groupName && items[i].recurrence) {
-        return items[i].id;
+      var item = items[i];
+      if (item.summary !== groupName) continue;
+      if (!item.recurrence) continue;
+
+      var startField = item.start && (item.start.dateTime || item.start.date);
+      if (!startField) continue;
+      var d = new Date(startField);
+      if (isNaN(d.getTime())) continue;
+
+      if (d.getDay() !== desiredDow) continue;
+
+      // If this is a timed event, also check the time of day
+      if (item.start.dateTime) {
+        if (d.getHours() !== desiredHour || d.getMinutes() !== desiredMinute) continue;
       }
+
+      return item.id;
     }
   } catch (e) {
     // fall through
@@ -852,11 +949,11 @@ function getRecurringEventIdByListing(calendarId, groupName, startDate, endDate)
 }
 
 /**
- * Adds trial guest to the single occurrence on trialDate via Calendar API (patch that instance).
+ * Adds trial guest to the single occurrence on trialDate via Calendar API (per-slot).
  * Requires Calendar Advanced Service (Google Calendar API) to be enabled.
  */
-function addTrialGuestToInstance(calendarId, recurringEventId, trialDate, trialEmail, schedule, reportEntries, groupName, rowIndex) {
-  var primarySlot = schedule.slots[0];
+function addTrialGuestToInstance(calendarId, recurringEventId, trialDate, trialEmail, slot, reportEntries, groupName, rowIndex) {
+  var primarySlot = slot;
   // Use calendar date (y/m/d) in script timezone so "2026-03-11" in sheet stays March 11, not March 10 UTC
   var y = trialDate.getFullYear();
   var m = trialDate.getMonth();
@@ -968,6 +1065,8 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Schedule Sync')
     .addItem('Run sync now', 'runSync')
+    .addSeparator()
+    .addItem('Delete group events…', 'deleteEventsByGroup')
     .addToUi();
 }
 
