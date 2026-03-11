@@ -148,7 +148,16 @@ function validateAndGroup(rawRows, reportEntries) {
 
   Object.keys(groupsByName).forEach(function(groupName) {
     var rows = groupsByName[groupName];
+    // Prefer a row that has a second slot defined (Dzień #2 / Godzina #2),
+    // so group schedule includes both slots when any row defines them.
     var first = rows[0];
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      if (r.day2 && r.time2) {
+        first = r;
+        break;
+      }
+    }
     var canonicalSchedule = buildGroupSchedule(first);
 
     var conflictingIndices = [];
@@ -201,7 +210,17 @@ function validateAndGroup(rawRows, reportEntries) {
 }
 
 function validateRow(raw) {
-  var v = function(h) { return raw.values[h]; };
+  // Flexible header lookup: tolerate non-breaking spaces and extra whitespace
+  var v = function(h) {
+    if (raw.values.hasOwnProperty(h)) return raw.values[h];
+    var target = String(h).replace(/\s+/g, ' ').trim();
+    for (var key in raw.values) {
+      if (!raw.values.hasOwnProperty(key)) continue;
+      var normKey = String(key).replace(/\s+/g, ' ').trim();
+      if (normKey === target) return raw.values[key];
+    }
+    return undefined;
+  };
 
   var emailRaw = v(HEADER_EMAIL);
   var groupRaw = v(HEADER_GROUP);
@@ -348,8 +367,32 @@ function validateRow(raw) {
 
 function parseWeekdayToken(value) {
   if (typeof value !== 'string') return null;
-  var t = value.trim();
-  if (['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].indexOf(t) !== -1) return t;
+  var raw = value.trim();
+  if (!raw) return null;
+
+  // Normalize common variants:
+  // - case-insensitive (tue, TUE)
+  // - with trailing punctuation (Tue.)
+  // - Polish abbreviations (Pn, Wt, Śr/Sr, Cz, Pt)
+  var t = raw.replace(/[.\s]+$/g, '').toLowerCase();
+
+  // English short
+  if (t.length >= 3) {
+    var first3 = t.slice(0, 3);
+    if (first3 === 'mon') return 'Mon';
+    if (first3 === 'tue') return 'Tue';
+    if (first3 === 'wed') return 'Wed';
+    if (first3 === 'thu') return 'Thu';
+    if (first3 === 'fri') return 'Fri';
+  }
+
+  // Polish short
+  if (t === 'pn') return 'Mon';
+  if (t === 'wt') return 'Tue';
+  if (t === 'sr' || t === 'śr') return 'Wed';
+  if (t === 'cz') return 'Thu';
+  if (t === 'pt') return 'Fri';
+
   return null;
 }
 
@@ -374,7 +417,8 @@ function parseTimeOfDay(value) {
 
   // Fallback: string in HH:mm
   if (typeof value === 'string') {
-    var m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+    // Accept "H:MM", "HH:MM", and also "H.MM" / "H,MM" (common in some locales)
+    var m = /^(\d{1,2})[:.,](\d{2})$/.exec(value.trim());
     if (!m) return null;
     var h2 = Number(m[1]);
     var mm2 = Number(m[2]);
@@ -538,17 +582,41 @@ function upsertEventsForGroups(calendar, validation, reportEntries) {
       return;
     }
 
-    var existingSeries = findExistingGroupSeries(calendar, bucket);
-    var series;
-    if (existingSeries) {
-      updateSeries(calendar, existingSeries, bucket, seriesEmails, description, reportEntries);
-      series = existingSeries;
-    } else {
-      series = createSeries(calendar, bucket, seriesEmails, description, reportEntries);
+    var slots = bucket.schedule.slots;
+    if (slots.length < 2) {
+      reportEntries.push(makeReportEntry({
+        action: 'DEBUG_ONLY_ONE_SLOT',
+        groupName: bucket.groupName,
+        details: 'slots.length=' + slots.length + '; day1=' + (slots[0] ? slots[0].weekday : '') +
+          ' time1=' + (slots[0] ? (slots[0].time.hour + ':' + (slots[0].time.minute < 10 ? '0' : '') + slots[0].time.minute) : '')
+      }));
     }
 
-    if (trialParticipants.length > 0 && series) {
-      if (!existingSeries) {
+    // Primary slot (Dzień #1 / Godzina #1)
+    var primarySlot = slots[0];
+    var existingSeriesPrimary = findExistingGroupSeriesForSlot(calendar, bucket, primarySlot) || findExistingGroupSeries(calendar, bucket);
+    var primarySeries;
+    if (existingSeriesPrimary) {
+      updateSeries(calendar, existingSeriesPrimary, bucket, primarySlot, seriesEmails, description, reportEntries);
+      primarySeries = existingSeriesPrimary;
+    } else {
+      primarySeries = createSeries(calendar, bucket, primarySlot, seriesEmails, description, reportEntries);
+    }
+
+    // Secondary slot (Dzień #2 / Godzina #2) if present
+    if (slots.length > 1 && slots[1] && slots[1].weekday && slots[1].time) {
+      var secondarySlot = slots[1];
+      var existingSeriesSecondary = findExistingGroupSeriesForSlot(calendar, bucket, secondarySlot);
+      if (existingSeriesSecondary) {
+        updateSeries(calendar, existingSeriesSecondary, bucket, secondarySlot, seriesEmails, description, reportEntries);
+      } else {
+        createSeries(calendar, bucket, secondarySlot, seriesEmails, description, reportEntries);
+      }
+    }
+
+    // Trial participants still attach via Calendar API by groupName and date range
+    if (trialParticipants.length > 0 && primarySeries) {
+      if (!existingSeriesPrimary) {
         Utilities.sleep(1500);
       }
       var recurringEventId = getRecurringEventIdByListing(CALENDAR_ID, bucket.groupName, bucket.schedule.startDate, bucket.schedule.endDate);
@@ -617,9 +685,9 @@ function alignDateToWeekday(baseDate, weekdayToken) {
   return d;
 }
 
-function createSeries(calendar, bucket, emails, description, reportEntries) {
+function createSeries(calendar, bucket, slot, emails, description, reportEntries) {
   var schedule = bucket.schedule;
-  var primarySlot = schedule.slots[0];
+  var primarySlot = slot;
 
   var alignedStartDate = alignDateToWeekday(schedule.startDate, primarySlot.weekday);
   var start = new Date(alignedStartDate.getTime());
@@ -630,18 +698,15 @@ function createSeries(calendar, bucket, emails, description, reportEntries) {
     .addWeeklyRule()
     .until(startOfNextDay(schedule.endDate));
 
-  // Add all weekdays in slots
-  schedule.slots.forEach(function(s) {
-    recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
-  });
+  // Only this slot's weekday
+  recurrence.onlyOnWeekday(toAppsScriptWeekday(primarySlot.weekday));
   recurrence.setTimeZone(Session.getScriptTimeZone());
 
   var eventSeries = runWithCalendarRetry(function() {
     var series = calendar.createEventSeries(bucket.groupName, start, end, recurrence, {
-      description: description
-    });
-    emails.forEach(function(email) {
-      series.addGuest(email);
+      description: description,
+      guests: emails.join(','),
+      sendInvites: false
     });
     return series;
   });
@@ -654,13 +719,13 @@ function createSeries(calendar, bucket, emails, description, reportEntries) {
   return eventSeries;
 }
 
-function updateSeries(calendar, series, bucket, emails, description, reportEntries) {
+function updateSeries(calendar, series, bucket, slot, emails, description, reportEntries) {
   // Update description always (idempotent enough)
   series.setDescription(description);
 
   // Update recurrence if schedule changed: for simplicity, we always reset
   var schedule = bucket.schedule;
-  var primarySlot = schedule.slots[0];
+  var primarySlot = slot;
   var alignedStartDate = alignDateToWeekday(schedule.startDate, primarySlot.weekday);
   var start = new Date(alignedStartDate.getTime());
   start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
@@ -669,9 +734,7 @@ function updateSeries(calendar, series, bucket, emails, description, reportEntri
     .addWeeklyRule()
     .until(startOfNextDay(schedule.endDate));
 
-  schedule.slots.forEach(function(s) {
-    recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
-  });
+  recurrence.onlyOnWeekday(toAppsScriptWeekday(primarySlot.weekday));
   recurrence.setTimeZone(Session.getScriptTimeZone());
 
   runWithCalendarRetry(function() {
@@ -720,6 +783,33 @@ function findExistingGroupSeries(calendar, bucket) {
     if (eStart >= bucket.schedule.startDate && eStart <= bucket.schedule.endDate) {
       return e.getEventSeries();
     }
+  }
+  return null;
+}
+
+function findExistingGroupSeriesForSlot(calendar, bucket, slot) {
+  var schedule = bucket.schedule;
+  var startWindow = new Date(schedule.startDate.getTime());
+  startWindow.setDate(startWindow.getDate() - 7);
+  var endWindow = new Date(schedule.endDate.getTime());
+  endWindow.setDate(endWindow.getDate() + 7);
+
+  var desiredDow = jsWeekdayFromToken(slot.weekday);
+  var desiredHour = slot.time.hour;
+  var desiredMinute = slot.time.minute;
+
+  var events = calendar.getEvents(startWindow, endWindow);
+  for (var i = 0; i < events.length; i++) {
+    var e = events[i];
+    if (!e.isRecurringEvent()) continue;
+    if (e.getTitle() !== bucket.groupName) continue;
+
+    var eStart = e.getStartTime();
+    if (eStart < schedule.startDate || eStart > schedule.endDate) continue;
+    if (eStart.getDay() !== desiredDow) continue;
+    if (eStart.getHours() !== desiredHour || eStart.getMinutes() !== desiredMinute) continue;
+
+    return e.getEventSeries();
   }
   return null;
 }
@@ -809,7 +899,7 @@ function addTrialGuestToInstance(calendarId, recurringEventId, trialDate, trialE
           description: instance.description || '',
           attendees: attendees
         };
-        Calendar.Events.insert(exceptionEvent, calendarId);
+        Calendar.Events.insert(exceptionEvent, calendarId, { sendUpdates: 'none' });
       }
       reportEntries.push(makeReportEntry({
         action: 'TRIAL_GUEST_ADDED_TO_INSTANCE',
