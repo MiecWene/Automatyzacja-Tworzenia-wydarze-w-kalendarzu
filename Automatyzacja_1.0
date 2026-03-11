@@ -2,6 +2,9 @@
  * CONFIG
  ******************************/
 
+// Require Calendar Advanced Service (Extensions > Advanced Google Services > Google Calendar API)
+// for adding trial guests to a single occurrence via Calendar.Events.instances + patch.
+
 // Calendar id from the spec
 var CALENDAR_ID = 'c16cb7e33da24f0de52777487619b3ec0f91d88acf84d6dc96b7f482590d808f@group.calendar.google.com';
 
@@ -525,28 +528,37 @@ function upsertEventsForGroups(calendar, validation, reportEntries) {
     var canonicalRow = seriesParticipants[0] || bucket.rows[0];
     var description = renderInvitationBody(canonicalRow);
 
-    // BEH-11 config
-    if (seriesEmails.length === 0 && !CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES) {
+    var needSeries = seriesEmails.length > 0 || trialParticipants.length > 0 || CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES;
+    if (!needSeries) {
       reportEntries.push(makeReportEntry({
         action: 'GROUP_SKIPPED_NO_ATTENDEES',
         groupName: bucket.groupName,
         details: 'Group has no confirmed non-trial participants'
       }));
-    } else {
-      var existingSeries = findExistingGroupSeries(calendar, bucket);
-      if (existingSeries) {
-        updateSeries(calendar, existingSeries, bucket, seriesEmails, description, reportEntries);
-      } else {
-        createSeries(calendar, bucket, seriesEmails, description, reportEntries);
-      }
+      return;
     }
 
-    // Trial events
-    trialParticipants.forEach(function(row) {
-      if (!row.trialDate) return;
-      var desc = renderInvitationBody(row);
-      createTrialEvent(calendar, bucket, row, desc, reportEntries);
-    });
+    var existingSeries = findExistingGroupSeries(calendar, bucket);
+    var series;
+    if (existingSeries) {
+      updateSeries(calendar, existingSeries, bucket, seriesEmails, description, reportEntries);
+      series = existingSeries;
+    } else {
+      series = createSeries(calendar, bucket, seriesEmails, description, reportEntries);
+    }
+
+    if (trialParticipants.length > 0 && series) {
+      if (!existingSeries) {
+        Utilities.sleep(1500);
+      }
+      var recurringEventId = getRecurringEventIdByListing(CALENDAR_ID, bucket.groupName, bucket.schedule.startDate, bucket.schedule.endDate);
+      if (recurringEventId) {
+        trialParticipants.forEach(function(row) {
+          if (!row.trialDate) return;
+          addTrialGuestToInstance(CALENDAR_ID, recurringEventId, row.trialDate, row.participantEmail, bucket.schedule, reportEntries, bucket.groupName, row.rowIndex);
+        });
+      }
+    }
   });
 }
 
@@ -639,6 +651,7 @@ function createSeries(calendar, bucket, emails, description, reportEntries) {
     groupName: bucket.groupName,
     details: 'Created recurring event; attendees: ' + emails.length
   }));
+  return eventSeries;
 }
 
 function updateSeries(calendar, series, bucket, emails, description, reportEntries) {
@@ -711,27 +724,109 @@ function findExistingGroupSeries(calendar, bucket) {
   return null;
 }
 
-function createTrialEvent(calendar, bucket, row, description, reportEntries) {
-  var schedule = bucket.schedule;
-  var primarySlot = schedule.slots[0];
-  var start = new Date(row.trialDate.getTime());
-  start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
-  var end = new Date(start.getTime() + 60 * 60 * 1000);
+/**
+ * Returns the recurring event id for the series (for use with Calendar API instances/patch).
+ * CalendarEventSeries.getId() returns iCalUID; the API instances() endpoint needs the short event id.
+ * So we look up the recurring event by listing events in the schedule range and matching by title.
+ */
+function getRecurringEventIdFromSeries(series) {
+  try {
+    return series.getId();
+  } catch (e) {
+    return null;
+  }
+}
 
-  runWithCalendarRetry(function() {
-    var event = calendar.createEvent(bucket.groupName, start, end, {
-      description: description
+/**
+ * Gets the short recurring event id via Calendar API list (for instances/patch).
+ * Calendar API events.instances() requires the event "id", not the iCalUID from CalendarApp.
+ */
+function getRecurringEventIdByListing(calendarId, groupName, startDate, endDate) {
+  try {
+    var timeMax = startOfNextDay(endDate).toISOString();
+    var response = Calendar.Events.list(calendarId, {
+      timeMin: new Date(startDate.getTime()).toISOString(),
+      timeMax: timeMax,
+      singleEvents: false
     });
-    event.addGuest(row.participantEmail);
-  });
+    var items = response.items || [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].summary === groupName && items[i].recurrence) {
+        return items[i].id;
+      }
+    }
+  } catch (e) {
+    // fall through
+  }
+  return null;
+}
 
-  reportEntries.push(makeReportEntry({
-    action: 'TRIAL_EVENT_CREATED',
-    groupName: bucket.groupName,
-    rowIndex: row.rowIndex,
-    details: 'Created trial event for ' + row.participantEmail +
-      ' on ' + row.trialDate.toISOString()
-  }));
+/**
+ * Adds trial guest to the single occurrence on trialDate via Calendar API (patch that instance).
+ * Requires Calendar Advanced Service (Google Calendar API) to be enabled.
+ */
+function addTrialGuestToInstance(calendarId, recurringEventId, trialDate, trialEmail, schedule, reportEntries, groupName, rowIndex) {
+  var primarySlot = schedule.slots[0];
+  // Use calendar date (y/m/d) in script timezone so "2026-03-11" in sheet stays March 11, not March 10 UTC
+  var y = trialDate.getFullYear();
+  var m = trialDate.getMonth();
+  var d = trialDate.getDate();
+  var start = new Date(y, m, d, primarySlot.time.hour, primarySlot.time.minute, 0, 0);
+  var end = new Date(start.getTime() + 60 * 60 * 1000);
+  var timeMin = start.toISOString();
+  var timeMax = end.toISOString();
+  var dateStr = y + '-' + (m + 1 < 10 ? '0' : '') + (m + 1) + '-' + (d < 10 ? '0' : '') + d;
+
+  try {
+    runWithCalendarRetry(function() {
+      var response = Calendar.Events.instances(calendarId, recurringEventId, {
+        timeMin: timeMin,
+        timeMax: timeMax
+      });
+      var items = response.items || [];
+      if (items.length === 0) {
+        reportEntries.push(makeReportEntry({
+          action: 'TRIAL_INSTANCE_NOT_FOUND',
+          groupName: groupName,
+          rowIndex: rowIndex,
+          details: 'No occurrence on ' + dateStr + ' for trial guest ' + trialEmail,
+          errorReason: 'Instance not in recurrence window or series not found'
+        }));
+        return;
+      }
+      var instance = items[0];
+      var attendees = instance.attendees || [];
+      var hasAlready = attendees.some(function(a) { return a.email === trialEmail; });
+      if (!hasAlready) {
+        attendees.push({ email: trialEmail });
+        var timeZone = Session.getScriptTimeZone();
+        var exceptionEvent = {
+          recurringEventId: recurringEventId,
+          originalStartTime: instance.originalStartTime || { dateTime: timeMin, timeZone: timeZone },
+          start: instance.start || { dateTime: timeMin, timeZone: timeZone },
+          end: instance.end || { dateTime: timeMax, timeZone: timeZone },
+          summary: instance.summary || groupName,
+          description: instance.description || '',
+          attendees: attendees
+        };
+        Calendar.Events.insert(exceptionEvent, calendarId);
+      }
+      reportEntries.push(makeReportEntry({
+        action: 'TRIAL_GUEST_ADDED_TO_INSTANCE',
+        groupName: groupName,
+        rowIndex: rowIndex,
+        details: 'Added ' + trialEmail + ' to occurrence on ' + dateStr
+      }));
+    });
+  } catch (e) {
+    reportEntries.push(makeReportEntry({
+      action: 'TRIAL_GUEST_ADD_FAILED',
+      groupName: groupName,
+      rowIndex: rowIndex,
+      details: 'Failed to add trial guest ' + trialEmail + ' to instance on ' + dateStr,
+      errorReason: String(e)
+    }));
+  }
 }
 
 /******************************
