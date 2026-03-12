@@ -676,3 +676,129 @@ With Data końca = 31.03, recurrence will run "until 31.03 23:59:59.999", so the
 Files affected: Automatyzacja_1.0
 
 Next steps: Builded the suggested config
+
+---
+
+## Entry – 10.03.2026
+
+**Context**: Per-slot scheduling for Dzień #1 / Dzień #2, trial lessons attached to the correct weekly series, and a dedicated deletion tool for group events.
+
+### Scheduling fixes (Dzień #1 / Dzień #2, inclusive end dates)
+
+- **Per-slot series instead of one combined series**  
+  - Decision: a single recurring series in Google Calendar can’t have different times on different weekdays, so each group (`Nazwa Grupy`) is modeled as up to **two separate series**:
+    - One for `Dzień #1` / `Godzina #1`.
+    - One for `Dzień #2` / `Godzina #2` (when present).
+  - Implementation in `Automatyzacja_1.0`:
+    - `buildGroupSchedule(row)` keeps `slots: [{ weekday: day1, time: time1 }, { weekday: day2, time: time2 }]` when Dzień #2 / Godzina #2 are valid.
+    - `createSeries(calendar, bucket, slot, emails, description, reportEntries)` now takes a **single `slot`**, aligns the first occurrence with `alignDateToWeekday(schedule.startDate, slot.weekday)`, and creates a weekly recurrence with `.onlyOnWeekday(toAppsScriptWeekday(slot.weekday))`.
+    - `updateSeries(calendar, series, bucket, slot, emails, description, reportEntries)` mirrors this logic for updates.
+    - `upsertEventsForGroups` loops over `bucket.schedule.slots` and creates/updates one series per slot for the same group name.
+
+- **End-date inclusivity**  
+  - Decision: events on `Data końca` must be included for all recurrences.
+  - Implementation:
+    - Introduced `endOfDay(date)` early on, then later switched to `startOfNextDay(date)` and used that for `.until(...)` on the recurrence:
+      - Recurrence now ends at the **start of the day after** `Data końca`, so all events on `Data końca` are included regardless of timezone/UTC normalization.
+
+- **Robust parsing for headers, weekdays and times**  
+  - Decision: tolerate Sheet quirks (non-breaking spaces in headers, Polish abbreviations, localized times).
+  - Implementation:
+    - `validateRow`’s header lookup now normalizes whitespace in header names (e.g. `Dzień #2` with NBSP vs `Dzień #2`).
+    - `parseWeekdayToken`:
+      - Accepts English short names (`Mon`, `Tue`, `Wed`, `Thu`, `Fri`, case-insensitive, with optional `.`).
+      - Accepts Polish short forms (`Pn`, `Wt`, `Śr`/`Sr`, `Cz`, `Pt`) and maps them onto the same tokens.
+    - `parseTimeOfDay`:
+      - Accepts time cells and numeric fractions.
+      - Accepts strings `H:MM`, `HH:MM`, but also `H.MM` / `H,MM` (common localized formats).
+    - When choosing a canonical row for a group in `validateAndGroup`, the code now **prefers** a row that has Dzień #2 / Godzina #2 set, so `bucket.schedule.slots` includes both slots whenever any row defines them.
+
+### Trial lessons (Data zajęć próbnych)
+
+- **Problem**: trials were originally added as separate one-off events or to a single series per group, so:
+  - They ignored Dzień #2 when computing the occurrence to attach to.
+  - They sometimes failed with “No occurrence on … Instance not in recurrence window or series not found”.
+
+- **Per-slot mapping for trials**  
+  - Decision: a trial lesson should be attached **only to the series matching its weekday**, per group.
+  - Implementation:
+    - Introduced `jsDayToToken(jsDay)` to convert `Date.getDay()` (1–5) to `"Mon" … "Fri"`.
+    - In `upsertEventsForGroups`:
+      - For each `trialParticipants` row, compute `token = jsDayToToken(trialDate.getDay())`.
+      - Find the matching `slot` in `bucket.schedule.slots` where `slot.weekday === token`.
+        - If none: log `TRIAL_SLOT_NOT_FOUND`.
+    - New helper `getRecurringEventIdForSlotByListing(calendarId, groupName, slot, startDate, endDate)`:
+      - Uses `Calendar.Events.list` (Advanced Calendar API) with `singleEvents: false` and a date window (schedule range ±7 days).
+      - Filters returned recurring events by:
+        - `summary === groupName`
+        - `recurrence` present
+        - The series’ `start` day-of-week matching `slot.weekday`, and, if timed, `start` hour/minute matching `slot.time`.
+      - Returns the short `id` for that slot’s series (suitable for `events.instances` / `recurringEventId`).
+
+- **Creating trial exceptions via API**  
+  - Decision: instead of patching instances directly, create **exceptions for individual occurrences** using `Events.insert` with `recurringEventId` and `originalStartTime`.
+  - Implementation in `addTrialGuestToInstance(calendarId, recurringEventId, trialDate, slot, ...)`:
+    - Builds `start`/`end` for the trial date using the slot’s time (using y/m/d from the date and the slot’s hour/minute in the script timezone so calendar days line up).
+    - Calls `Calendar.Events.instances(calendarId, recurringEventId, { timeMin, timeMax })` to locate the occurrence for that date.
+    - If an instance is found:
+      - Reads or initializes `instance.attendees`, appends `{ email: trialEmail }` if not already present.
+      - Constructs `exceptionEvent` with:
+        - `recurringEventId` = slot’s series id,
+        - `originalStartTime` from `instance.originalStartTime` (or the computed `timeMin`/timezone),
+        - `start` / `end` from the instance (or `timeMin`/`timeMax`),
+        - `summary` = group name, `description` from the instance,
+        - `attendees` including the trial email.
+      - Calls `Calendar.Events.insert(exceptionEvent, calendarId, { sendUpdates: 'none' })`.
+    - Logs:
+      - `TRIAL_GUEST_ADDED_TO_INSTANCE` on success.
+      - `TRIAL_INSTANCE_NOT_FOUND` or `TRIAL_GUEST_ADD_FAILED` with detailed reasons when something goes wrong.
+
+- **Email/noise control**  
+  - Decision: minimize email noise from automation while accepting that guest add/remove via `CalendarApp` may still generate some notifications.
+  - Implementation:
+    - `createSeries` now uses:
+      - `createEventSeries(title, start, end, recurrence, { description, guests: emails.join(','), sendInvites: false })`
+      - No more `series.addGuest(...)` in the initial creation call.
+    - API calls to create exceptions use `sendUpdates: 'none'` to suppress extra email.
+
+### Deletion tooling (Usuwanie_wydarzen)
+
+- **Goal**: safely delete all events for one or more groups (`Nazwa Grupy`) via a friendly UI, without touching unrelated events.
+
+- **Separate deletion script**  
+  - Implemented in `Usuwanie_wydarzen_1.0` (and integrated into the main Apps Script project):
+    - Reads schedule data from `Test_Schedule_Month_Script` (using a minimal header-based parser).
+    - Builds a `groupInfo` map of `groupName -> { startDate, endDate }` (widest window across rows).
+
+- **HTML dialog and handler**  
+  - `deleteEventsByGroup()`:
+    - Gathers all group names from the schedule.
+    - Shows an `HtmlService`-based dialog with checkboxes for each group name, plus **Select all**, **Clear**, **Delete selected**, **Cancel**.
+    - On “Delete selected”, calls `google.script.run.handleDeleteGroups(selectedNames)`.
+  - `handleDeleteGroups(selectedGroupNames)`:
+    - For each selected group:
+      - Computes `startWindow = startDate - buffer`, `endWindow = endDate + buffer`.
+      - Calls `calendar.getEvents(startWindow, endWindow)`.
+      - For each event with `getTitle() === groupName`:
+        - If `isRecurringEvent()`:
+          - Retrieves `getEventSeries()` and calls `deleteEventSeries()` once per series id.
+        - Else:
+          - Calls `deleteEvent()` (covers trial exceptions).
+    - Aggregates counts per group: `{ seriesDeletedCount, singleDeletedCount }`.
+
+- **Audit reporting**  
+  - `writeDeleteReport(ss, results)`:
+    - Writes a `Delete_Report` sheet with:
+      - Timestamp, GroupName, StartDate, EndDate, SeriesDeleted, SingleDeleted, Error.
+    - Gives a clear audit trail for which events were removed and when.
+
+- **Menu integration**  
+  - `onOpen()` in the main Apps Script project now creates a single menu:
+    - `Schedule Sync` with:
+      - `Run sync now` → `runSync()`
+      - `Delete group events…` → `deleteEventsByGroup()`
+
+### Files affected
+
+- `Automatyzacja_1.0` – scheduling logic (per-slot series, inclusive end date), trial handling (per-slot series mapping, Calendar API exceptions, email control), menu integration.
+- `Usuwanie_wydarzen_1.0` – standalone deletion tooling (HTML dialog, group-based deletion, `Delete_Report`).
