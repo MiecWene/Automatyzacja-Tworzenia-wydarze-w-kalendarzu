@@ -1,0 +1,299 @@
+/******************************
+ * CONFIG
+ ******************************/
+
+// Calendar id where events live
+var CALENDAR_ID =
+  'c_102b836f14297b1391e79d8c20c718e237d77ca6bea51c2ae5b9e7659e918897@group.calendar.google.com';
+
+// Sheet tab containing schedule (same as main script)
+var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
+
+// Where to write deletion audit
+var DELETE_REPORT_SHEET_NAME = 'Delete_Report';
+
+// Search buffer around schedule window when locating events
+var DELETE_WINDOW_BUFFER_DAYS = 7;
+
+function authorizeDeleteTool() {
+  // Touch both Spreadsheet and Calendar so Google asks for all needed scopes
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+  if (!sheet) throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
+
+  var calendar = CalendarApp.getCalendarById(CALENDAR_ID);
+  if (!calendar) throw new Error('Calendar with id ' + CALENDAR_ID + ' not found or not accessible');
+
+  // No-op read to ensure access
+  ss.getName();
+  calendar.getName();
+}
+
+/******************************
+ * ENTRYPOINT
+ ******************************/
+
+function deleteEventsByGroup() {
+  var ss = SpreadsheetApp.getActive();
+  var scheduleSheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+  if (!scheduleSheet) throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
+
+  var groupInfo = buildGroupInfo(scheduleSheet); // { groupName: {startDate, endDate} }
+  var groupNames = Object.keys(groupInfo).sort();
+
+  if (groupNames.length === 0) {
+    SpreadsheetApp.getUi().alert('No groups found in "' + SCHEDULE_SHEET_NAME + '".');
+    return;
+  }
+
+  var html = buildGroupDeleteDialogHtml(groupNames);
+  SpreadsheetApp.getUi().showModalDialog(
+    HtmlService.createHtmlOutput(html).setWidth(520).setHeight(560),
+    'Delete group events'
+  );
+}
+
+/**
+ * Called by the dialog. Deletes all recurring series + all single events
+ * for each selected group within that group's schedule date range (+/- buffer).
+ */
+function handleDeleteGroups(selectedGroupNames) {
+  if (!selectedGroupNames || !selectedGroupNames.length) return { ok: true, deleted: [] };
+
+  var ss = SpreadsheetApp.getActive();
+  var scheduleSheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+  if (!scheduleSheet) throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
+
+  var calendar = CalendarApp.getCalendarById(CALENDAR_ID);
+  if (!calendar) throw new Error('Calendar with id ' + CALENDAR_ID + ' not found or not accessible');
+
+  var groupInfo = buildGroupInfo(scheduleSheet);
+  var results = [];
+
+  selectedGroupNames.forEach(function(groupName) {
+    var info = groupInfo[groupName];
+    if (!info) {
+      results.push({ groupName: groupName, error: 'Group not found in schedule' });
+      return;
+    }
+
+    var startWindow = new Date(info.startDate.getTime());
+    startWindow.setDate(startWindow.getDate() - DELETE_WINDOW_BUFFER_DAYS);
+    var endWindow = new Date(info.endDate.getTime());
+    endWindow.setDate(endWindow.getDate() + DELETE_WINDOW_BUFFER_DAYS);
+
+    var events = calendar.getEvents(startWindow, endWindow);
+
+    var seriesDeletedById = {};
+    var seriesDeletedCount = 0;
+    var singleDeletedCount = 0;
+
+    events.forEach(function(e) {
+      if (e.getTitle() !== groupName) return;
+
+      if (e.isRecurringEvent()) {
+        // Multiple instances point to the same series; delete once.
+        var series = e.getEventSeries();
+        var seriesId = '';
+        try { seriesId = series.getId(); } catch (_) { seriesId = String(new Date().getTime()) + Math.random(); }
+        if (seriesDeletedById[seriesId]) return;
+        seriesDeletedById[seriesId] = true;
+        series.deleteEventSeries();
+        seriesDeletedCount++;
+      } else {
+        e.deleteEvent();
+        singleDeletedCount++;
+      }
+    });
+
+    results.push({
+      groupName: groupName,
+      startDate: info.startDate,
+      endDate: info.endDate,
+      seriesDeletedCount: seriesDeletedCount,
+      singleDeletedCount: singleDeletedCount
+    });
+  });
+
+  writeDeleteReport(ss, results);
+  return { ok: true, deleted: results };
+}
+
+/******************************
+ * DIALOG HTML
+ ******************************/
+
+function buildGroupDeleteDialogHtml(groupNames) {
+  var data = JSON.stringify(groupNames);
+  return '' +
+'<!doctype html>' +
+'<html><head><base target=\"_top\">' +
+'<meta charset=\"utf-8\">' +
+'<style>' +
+'  body{font-family:Arial,Helvetica,sans-serif; padding:12px;}' +
+'  .controls{display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;}' +
+'  button{padding:6px 10px;}' +
+'  .list{border:1px solid #ddd; border-radius:6px; padding:10px; height:360px; overflow:auto;}' +
+'  .row{display:flex; align-items:center; gap:8px; padding:4px 0;}' +
+'  .danger{background:#b00020; color:white; border:none; border-radius:6px;}' +
+'  .muted{color:#666; font-size:12px; margin-top:8px;}' +
+'  .status{margin-top:10px; font-size:12px; white-space:pre-wrap;}' +
+'</style>' +
+'</head><body>' +
+'<div class=\"controls\">' +
+'  <button type=\"button\" onclick=\"selectAll(true)\">Select all</button>' +
+'  <button type=\"button\" onclick=\"selectAll(false)\">Clear</button>' +
+'  <button type=\"button\" class=\"danger\" onclick=\"doDelete()\">Delete selected</button>' +
+'  <button type=\"button\" onclick=\"google.script.host.close()\">Cancel</button>' +
+'</div>' +
+'<div class=\"list\" id=\"list\"></div>' +
+'<div class=\"muted\">Deletes all recurring series and single events for the selected group names within their schedule date ranges (plus a small buffer).</div>' +
+'<div class=\"status\" id=\"status\"></div>' +
+'<script>' +
+'const groups = ' + data + ';' +
+'const list = document.getElementById(\"list\");' +
+'const statusEl = document.getElementById(\"status\");' +
+'function render(){' +
+'  list.innerHTML = groups.map(g => ' +
+'    `<label class=\"row\"><input type=\"checkbox\" value=\"${escapeHtml(g)}\"> <span>${escapeHtml(g)}</span></label>`' +
+'  ).join(\"\");' +
+'}' +
+'function escapeHtml(s){' +
+'  return String(s)' +
+'    .replace(/&/g,\"&amp;\")' +
+'    .replace(/</g,\"&lt;\")' +
+'    .replace(/>/g,\"&gt;\");' +
+'}' +
+'function selectAll(on){' +
+'  document.querySelectorAll(\"#list input[type=checkbox]\").forEach(cb => cb.checked = on);' +
+'}' +
+'function doDelete(){' +
+'  const selected = Array.from(document.querySelectorAll(\"#list input[type=checkbox]:checked\")).map(cb => cb.value);' +
+'  if(selected.length===0){ statusEl.textContent = \"Select at least one group.\"; return; }' +
+'  statusEl.textContent = `Deleting ${selected.length} group(s)…`;'+
+'  google.script.run' +
+'    .withSuccessHandler(res => {' +
+'      statusEl.textContent = \"Done. See Delete_Report sheet for details.\";' +
+'    })' +
+'    .withFailureHandler(err => {' +
+'      statusEl.textContent = \"Failed: \" + (err && err.message ? err.message : String(err));' +
+'    })' +
+'    .handleDeleteGroups(selected);' +
+'}' +
+'render();' +
+'</script>' +
+'</body></html>';
+}
+
+/******************************
+ * SCHEDULE PARSING (minimal)
+ ******************************/
+
+var HEADER_GROUP_NAME = 'Nazwa Grupy';
+var HEADER_START_DATE = 'Data startu';
+var HEADER_END_DATE = 'Data końca';
+
+function readScheduleRows(sheet) {
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  var headerRow = values[0];
+  var headers = headerRow.map(String);
+
+  var rows = [];
+  for (var i = 1; i < values.length; i++) {
+    var map = {};
+    for (var c = 0; c < headers.length; c++) {
+      map[headers[c]] = values[i][c];
+    }
+    rows.push({ rowIndex: i + 1, values: map });
+  }
+  return rows;
+}
+
+function valueByHeader(valuesMap, headerName) {
+  if (valuesMap.hasOwnProperty(headerName)) return valuesMap[headerName];
+  var target = String(headerName).replace(/\s+/g, ' ').trim();
+  for (var key in valuesMap) {
+    if (!valuesMap.hasOwnProperty(key)) continue;
+    var normKey = String(key).replace(/\s+/g, ' ').trim();
+    if (normKey === target) return valuesMap[key];
+  }
+  return undefined;
+}
+
+function parseDateCell(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return new Date(value.getTime());
+  }
+  if (typeof value === 'string') {
+    var d = new Date(value);
+    if (isNaN(d.getTime())) return null;
+    return d;
+  }
+  return null;
+}
+
+function buildGroupInfo(sheet) {
+  var rows = readScheduleRows(sheet);
+  var info = {};
+
+  rows.forEach(function(r) {
+    var groupName = valueByHeader(r.values, HEADER_GROUP_NAME);
+    if (!groupName) return;
+    groupName = String(groupName).trim();
+    if (!groupName) return;
+
+    var startRaw = valueByHeader(r.values, HEADER_START_DATE);
+    var endRaw = valueByHeader(r.values, HEADER_END_DATE);
+    var start = parseDateCell(startRaw);
+    var end = parseDateCell(endRaw);
+    if (!start || !end) return;
+
+    // Keep widest window across rows for the group
+    if (!info[groupName]) {
+      info[groupName] = { startDate: start, endDate: end };
+    } else {
+      if (start.getTime() < info[groupName].startDate.getTime()) info[groupName].startDate = start;
+      if (end.getTime() > info[groupName].endDate.getTime()) info[groupName].endDate = end;
+    }
+  });
+
+  return info;
+}
+
+function startOfNextDay(date) {
+  var d = new Date(date.getTime());
+  d.setDate(d.getDate() + 1);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+/******************************
+ * REPORTING
+ ******************************/
+
+function writeDeleteReport(ss, results) {
+  var sheet = ss.getSheetByName(DELETE_REPORT_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(DELETE_REPORT_SHEET_NAME);
+
+  sheet.clearContents();
+  var header = ['Timestamp', 'GroupName', 'StartDate', 'EndDate', 'SeriesDeleted', 'SingleDeleted', 'Error'];
+  var rows = [header];
+
+  var ts = new Date();
+  results.forEach(function(r) {
+    rows.push([
+      ts,
+      r.groupName || '',
+      r.startDate || '',
+      r.endDate || '',
+      r.seriesDeletedCount || 0,
+      r.singleDeletedCount || 0,
+      r.error || ''
+    ]);
+  });
+
+  sheet.getRange(1, 1, rows.length, header.length).setValues(rows);
+}
+
