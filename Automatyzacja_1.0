@@ -14,7 +14,7 @@ var REPORT_SHEET_NAME = 'Run_Report';
 
 // Behavior toggles
 var PHASE1_ONLY = false; // true = validation + reporting only, no calendar changes
-var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = true; // BEH-11 default
+var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = false; // BEH-11: skip groups with no confirmed (and no trial) participants
 
 // Retry for transient Calendar API errors (e.g. "Service unavailable: Calendar")
 var CALENDAR_RETRY_ATTEMPTS = 3;
@@ -699,7 +699,7 @@ function partitionParticipants(bucket) {
       row.trialDate.getTime() >= bucket.schedule.startDate.getTime() &&
       row.trialDate.getTime() <= bucket.schedule.endDate.getTime();
 
-    if (hasTrial) {
+    if (hasTrial && row.confirmed) {
       trials.push(row);
     } else if (row.confirmed) {
       series.push(row);
@@ -1063,10 +1063,9 @@ function writeRunReport(ss, entries) {
 
 function onOpen() {
   SpreadsheetApp.getUi()
-    .createMenu('Schedule Sync')
-    .addItem('Run sync now', 'runSync')
+    .createMenu('Zarządzanie wydarzeniami')
+    .addItem('Utwórz wydarzenia', 'runSync')
     .addSeparator()
-    .addItem('Delete group events…', 'deleteEventsByGroup')
+    .addItem('Usuń wydarzenia', 'deleteEventsByGroup_1_1_withUi')
     .addToUi();
 }
-

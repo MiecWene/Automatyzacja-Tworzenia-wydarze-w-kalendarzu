@@ -910,3 +910,58 @@ Next steps: Builded the suggested config
   - `handleDeleteGroups_1_2()` – core deletion; shared between dialog-based and potential future non-UI entrypoints.
 
 Across all versions, the **core invariant** is preserved: for each chosen group name, delete all recurring series and single events whose title matches the group, within that group’s schedule-based date range (with a configurable ± buffer), and write a detailed `Delete_Report` sheet for audit.
+
+---
+
+## Confirmed = False: do not create events when no confirmed participants (BEH-11)
+
+**Date:** 14.03.2026
+
+**Context:** Automatyzacja_1.0 was creating calendar events even when all participants in the Test_Schedule_Month_Script tab had the "Confirmed" column set to False. Users expect no events to be created for such groups.
+
+**Goal:** When every participant in a group has Confirmed = False (and there are no trial participants in range), the script should skip that group and not create or update any calendar events.
+
+**Current behavior analysis:**
+
+- The "Confirmed" column is read in `validateRow` (HEADER_CONFIRMED) and stored as `row.confirmed`.
+- `partitionParticipants` correctly puts only rows with `row.confirmed === true` into `seriesParticipants`; rows with a trial date in range go to `trialParticipants`. So who gets added as attendees already respected Confirmed.
+- The decision to create a series at all is in `upsertEventsForGroups`:  
+  `needSeries = seriesEmails.length > 0 || trialParticipants.length > 0 || CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES`
+- When all rows have Confirmed = False and no trial in range: `seriesEmails` and `trialParticipants` are both empty, but `CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES` was set to `true` (BEH-11 default), so `needSeries` remained true and events were still created.
+
+**Root cause:** The config flag `CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = true` forces the script to create events even when there are no confirmed and no trial participants.
+
+**Fix:** Set `CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = false` so that when there are no confirmed and no trial participants, the group is skipped (GROUP_SKIPPED_NO_ATTENDEES) and no calendar events are created.
+
+**What was changed in the script (Automatyzacja_1.0):**
+
+- Line 17: `var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = true;` → `var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = false;` with comment updated to: "BEH-11: skip groups with no confirmed (and no trial) participants".
+
+**Result:** Groups where all participants have Confirmed = False and no trial participants in range no longer get any calendar events; they are reported as GROUP_SKIPPED_NO_ATTENDEES. Groups with at least one confirmed or one trial participant still get events as before.
+
+---
+
+## Confirmed = False: do not add trial participants when Confirmed is false
+
+**Date:** 14.03.2026
+
+**Context:** When a row had "Data zajęć próbnych" (trial date) set but "Confirmed" set to False, that participant was still added to the calendar event as a trial guest. Users want only confirmed participants (including confirmed trial participants) to be added.
+
+**Goal:** Trial participants (rows with Data zajęć próbnych in the schedule range) should be added to events only when Confirmed = True. Rows with a trial date but Confirmed = False must not be added to any event.
+
+**Current behavior analysis:**
+
+- In `partitionParticipants`, any row with a trial date in the schedule range (`hasTrial`) was always pushed to `trialParticipants`, regardless of `row.confirmed`.
+- `row.confirmed` was only checked for non-trial rows (for `seriesParticipants`). So trial-eligible rows were all sent to `addTrialGuestToInstance`.
+
+**Root cause:** The condition for adding to `trialParticipants` was only `hasTrial`; it did not require `row.confirmed`.
+
+**Fix:** Require both a trial date in range and Confirmed = true for a row to be added to `trialParticipants`: use `if (hasTrial && row.confirmed)` instead of `if (hasTrial)`.
+
+**What was changed in the script (Automatyzacja_1.0):**
+
+- In `partitionParticipants` (around lines 702–706):  
+  `if (hasTrial) { trials.push(row); }` → `if (hasTrial && row.confirmed) { trials.push(row); }`  
+  The `else if (row.confirmed) { series.push(row); }` branch is unchanged.
+
+**Result:** Rows with trial date set but Confirmed = false are no longer added to `trialParticipants`, so they are not added to any calendar event. Trial date + Confirmed = true still adds them as trial guests. Non-trial rows are still handled as before (only confirmed go to series).
