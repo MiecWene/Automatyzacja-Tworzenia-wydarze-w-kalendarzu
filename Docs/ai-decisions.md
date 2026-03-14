@@ -802,3 +802,111 @@ Next steps: Builded the suggested config
 
 - `Automatyzacja_1.0` – scheduling logic (per-slot series, inclusive end date), trial handling (per-slot series mapping, Calendar API exceptions, email control), menu integration.
 - `Usuwanie_wydarzen_1.0` – standalone deletion tooling (HTML dialog, group-based deletion, `Delete_Report`).
+
+---
+
+## Entry – 14.03.2026
+
+**Context**: The original deletion tool (`Usuwanie_wydarzen_1.0`) worked functionally but was intermittently returning a \"permission denied\" error when invoked via the HtmlService dialog. The goal was to preserve the same deletion semantics while experimenting with different UI shapes and execution contexts to identify a more reliable approach.
+
+### 1. Script-only deletion (Usuwanie_wydarzen_1.1)
+
+- **Goal**: Eliminate HtmlService / `google.script.run` from the path to see if the error was related to the client-side sandbox or cross-context calls, and provide a deterministic, editor-runnable deletion flow.
+
+- **Design**  
+  - New file: `Usuwanie_Wydarzen_1.1`.  
+  - Introduced a versioned config and helpers (`CALENDAR_ID`, `SCHEDULE_SHEET_NAME`, `DELETE_WINDOW_BUFFER_DAYS`, etc. kept aligned with 1.0).  
+  - Split concerns into:
+    - `deleteEventsByGroup_1_1()` – **script-only entrypoint**:
+      - Reads all groups from `Test_Schedule_Month_Script` via `buildGroupInfo_1_1`.
+      - Sorts group names and, if any exist, calls `handleDeleteGroups_1_1(groupNames)` to delete events for **all** groups.
+      - Logs progress and completion to `Logger` (no UI).
+    - `handleDeleteGroups_1_1(selectedGroupNames)` – **core deletion**:
+      - For each group:
+        - Builds `startWindow` / `endWindow` as schedule range ± `DELETE_WINDOW_BUFFER_DAYS`.
+        - Calls `calendar.getEvents(startWindow, endWindow)`.
+        - Deletes:
+          - Each recurring series once via `deleteEventSeries()` (deduplicating series by id).
+          - All matching single events via `deleteEvent()` (including trial exceptions).
+      - Accumulates `{ groupName, startDate, endDate, seriesDeletedCount, singleDeletedCount }` per group.
+      - Writes all results via `writeDeleteReport_1_1`, reusing the `Delete_Report` layout.
+  - A helper `authorizeDeleteTool_1_1()` touches Spreadsheet + Calendar once to ensure all scopes are granted before running deletion.
+
+- **Result / lessons**  
+  - This path removed HtmlService entirely; any residual \"permission denied\" would more clearly point to project-level scopes or Calendar ACLs rather than the dialog plumbing.
+  - It also provided a safe, non-interactive batch delete mechanism that can be invoked directly from the Apps Script editor when needed.
+
+### 2. Simple prompt UI (Usuwanie_wydarzen_1.1 with UI)
+
+- **Goal**: Add a lightweight way to delete **only selected groups**, still without HtmlService, using spreadsheet-native UI.
+
+- **Design**  
+  - Function `deleteEventsByGroup_1_1_withUi()`:
+    - Uses `SpreadsheetApp.getUi().prompt` instead of HtmlService:
+      - Shows a short preview of available group names (first N) and asks the user to input either:
+        - A comma-separated list of group names, or
+        - `*` to delete all groups.
+    - Parses and validates the input:
+      - Splits by comma, trims, filters non-empty names.
+      - Keeps only names present in `groupInfo_1_1` (ignores unknown names).
+      - If the resulting list is empty, alerts the user and exits.
+    - Asks for a final confirmation listing the selected group names.
+    - On confirmation, calls `handleDeleteGroups_1_1(selectedGroupNames)` and summarizes the number of deleted series and single events via `ui.alert` and `Logger`.
+  - This kept all deletion semantics identical to `deleteEventsByGroup_1_1` but introduced a minimal interactive filter without reintroducing HtmlService.
+
+- **Rationale**  
+  - Using `SpreadsheetApp.getUi()` keeps everything server-side inside the spreadsheet context, avoiding the HtmlService iframe and `google.script.run` layer that might trigger permission anomalies.
+  - The command-line-like input model is less user-friendly than checkboxes but very robust.
+
+### 3. Checkbox dialog v2 (Usuwanie_wydarzen_1.2)
+
+- **Goal**: Reintroduce a **checkbox-based selection UI** (like 1.0) while keeping the battle-tested deletion core, and isolating version-specific behavior in a separate file (`Usuwanie_wydarzen_1.2`).
+
+- **Design**  
+  - New file: `Usuwanie_Wydarzen_1.2`, with versioned config (`CALENDAR_ID_1_2`, `SCHEDULE_SHEET_NAME_1_2`, etc.) and helpers, but semantically the same as 1.1.
+  - Core deletion:
+    - `handleDeleteGroups_1_2(selectedGroupNames)`:
+      - Mirrors `handleDeleteGroups_1_1`, but uses the 1.2 config/constants.
+      - Same logic for windows, deduped recurring series deletion, single-event deletion, and `Delete_Report` writing (now via `writeDeleteReport_1_2`).
+  - Checkbox dialog:
+    - `deleteEventsByGroup_1_2_dialog()`:
+      - Reads `groupInfo_1_2` and builds a sorted list of group names.
+      - If no groups, uses `SpreadsheetApp.getUi().alert` and exits.
+      - Calls `SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html), ...)` where `html` is generated by `buildGroupDeleteDialogHtml_1_2(groupNames)`.
+    - `buildGroupDeleteDialogHtml_1_2(groupNames)`:
+      - Embeds `groupNames` as JSON.
+      - Renders one checkbox row per group with **Select all**, **Clear**, **Delete selected**, **Cancel** controls.
+      - On “Delete selected”:
+        - Gathers all checked checkbox values.
+        - If none selected, shows an inline status message.
+        - Otherwise calls `google.script.run.handleDeleteGroups_1_2_fromDialog(selected)` with success/failure handlers.
+    - `handleDeleteGroups_1_2_fromDialog(selectedGroupNames)`:
+      - Delegates to `handleDeleteGroups_1_2(selectedGroupNames || [])`.
+      - Aggregates `totalSeries` and `totalSingle` across all groups.
+      - Returns `{ ok: true, totalSeries, totalSingle, deleted: [...] }` to the client.
+    - The client success handler displays a final status like:
+      - “Done. Deleted X series and Y single events. See Delete_Report sheet for details.”
+
+- **Rationale and differences vs 1.0**  
+  - Behavior:
+    - Series/single-event deletion and audit report semantics are deliberately identical to 1.0; the only structural change is that the **core deletion logic is now clearly separated** into `handleDeleteGroups_1_2`, making it easier to test and to call from multiple UIs.
+  - Stability:
+    - Having 1.1 (script-only, no HtmlService) and 1.1_withUi (spreadsheet UI) available provides fallbacks if HtmlService again causes \"permission denied\" in certain environments.
+  - UX:
+    - 1.2 restores a point-and-click checkbox UI, which is more user-friendly than comma-separated input, while still logging and reporting exactly as before.
+
+### Deletion variants overview
+
+- **Usuwanie_wydarzen_1.0**  
+  - HtmlService checkbox dialog + `deleteEventsByGroup()` / `handleDeleteGroups()`.  
+  - Original implementation; sometimes hit \"permission denied\" from the dialog context.
+
+- **Usuwanie_wydarzen_1.1**  
+  - `deleteEventsByGroup_1_1()` – script-only, deletes **all groups**; usable from the Apps Script editor.  
+  - `deleteEventsByGroup_1_1_withUi()` – spreadsheet prompt UI (comma-separated list or `*`), no HtmlService.
+
+- **Usuwanie_wydarzen_1.2**  
+  - `deleteEventsByGroup_1_2_dialog()` – HtmlService checkbox dialog v2 built on top of `handleDeleteGroups_1_2`.  
+  - `handleDeleteGroups_1_2()` – core deletion; shared between dialog-based and potential future non-UI entrypoints.
+
+Across all versions, the **core invariant** is preserved: for each chosen group name, delete all recurring series and single events whose title matches the group, within that group’s schedule-based date range (with a configurable ± buffer), and write a detailed `Delete_Report` sheet for audit.
