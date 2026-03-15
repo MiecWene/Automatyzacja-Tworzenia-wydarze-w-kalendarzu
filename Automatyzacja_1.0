@@ -6,7 +6,7 @@
 // for adding trial guests to a single occurrence via Calendar.Events.instances + patch.
 
 // Calendar id from the spec
-var CALENDAR_ID = 'c16cb7e33da24f0de52777487619b3ec0f91d88acf84d6dc96b7f482590d808f@group.calendar.google.com';
+var CALENDAR_ID = 'c_3820bc90d9604b08016510447742d4a70a85beb977ca03884dc44fa04a9833b7@group.calendar.google.com';
 
 // Sheet and tab names
 var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
