@@ -6,7 +6,7 @@
 // for adding trial guests to a single occurrence via Calendar.Events.instances + patch.
 
 // Calendar id from the spec
-var CALENDAR_ID = 'c_3820bc90d9604b08016510447742d4a70a85beb977ca03884dc44fa04a9833b7@group.calendar.google.com';
+var CALENDAR_ID = 'c16cb7e33da24f0de52777487619b3ec0f91d88acf84d6dc96b7f482590d808f@group.calendar.google.com';
 
 // Sheet and tab names
 var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
@@ -54,6 +54,9 @@ function runSync() {
 
     // Finally write the run report
     writeRunReport(ss, reportEntries);
+
+    // Show confirmation: which groups had events created and how many per group
+    showCreatedEventsSummary(reportEntries);
   } catch (e) {
     reportEntries.push(makeReportEntry({
       action: 'API_FAILURE',
@@ -1029,6 +1032,53 @@ function makeReportEntry(fields) {
     details: fields.details || '',
     errorReason: fields.errorReason || ''
   };
+}
+
+/**
+ * Builds a map of groupName -> count of successfully created events from report entries.
+ * Only counts entries with action === 'EVENT_CREATED'.
+ */
+function getCreatedEventsByGroup(reportEntries) {
+  var createdByGroup = {};
+  reportEntries.forEach(function(e) {
+    if (e.action === 'EVENT_CREATED' && e.groupName) {
+      var name = String(e.groupName).trim();
+      if (name) {
+        createdByGroup[name] = (createdByGroup[name] || 0) + 1;
+      }
+    }
+  });
+  return createdByGroup;
+}
+
+/**
+ * Shows a popup alert summarizing which groups had calendar events created and how many per group.
+ * Safe to call when UI is unavailable (e.g. trigger); does nothing in that case.
+ */
+function showCreatedEventsSummary(reportEntries) {
+  try {
+    var ui = SpreadsheetApp.getUi();
+    if (!ui) return;
+
+    var createdByGroup = getCreatedEventsByGroup(reportEntries);
+    var groupNames = Object.keys(createdByGroup);
+    var message;
+
+    if (groupNames.length === 0) {
+      message = 'Nie utworzono żadnych nowych wydarzeń w kalendarzu.';
+    } else {
+      message = 'Utworzono wydarzenia w następujących grupach:\n\n';
+      groupNames.forEach(function(name) {
+        var count = createdByGroup[name];
+        var word = count === 1 ? 'wydarzenie' : (count >= 2 && count <= 4 ? 'wydarzenia' : 'wydarzeń');
+        message += '- ' + name + ': ' + count + ' ' + word + '\n';
+      });
+    }
+
+    ui.alert('Synchronizacja kalendarza', message, ui.ButtonSet.OK);
+  } catch (e) {
+    Logger.log('showCreatedEventsSummary: ' + (e && e.message ? e.message : String(e)));
+  }
 }
 
 function writeRunReport(ss, entries) {
