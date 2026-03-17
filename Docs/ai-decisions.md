@@ -965,3 +965,93 @@ Across all versions, the **core invariant** is preserved: for each chosen group 
   The `else if (row.confirmed) { series.push(row); }` branch is unchanged.
 
 **Result:** Rows with trial date set but Confirmed = false are no longer added to `trialParticipants`, so they are not added to any calendar event. Trial date + Confirmed = true still adds them as trial guests. Non-trial rows are still handled as before (only confirmed go to series).
+
+---
+
+## Post-creation summary prompt (EVENT_CREATED per group)
+
+**Date:** 15.03.2026
+
+**Context:** After running `runSync` in `Automatyzacja_1.0`, users want a quick confirmation of **which groups (`Nazwa Grupy`) actually had events created** and **how many events per group**, without digging into the `Run_Report` sheet.
+
+**Goal:** After calendar operations complete, show a single `SpreadsheetApp.getUi().alert` that summarizes, per group name, how many events were created, or clearly states when no new events were created.
+
+**Decisions:**
+
+- **Source of truth:** Use existing `reportEntries` and only count entries with `action === 'EVENT_CREATED'` and a non-empty `groupName`. Do **not** count `EVENT_UPDATED`, so the summary truly reflects created events.
+- **Aggregation:** Introduce `getCreatedEventsByGroup(reportEntries)` that returns a map `groupName -> count` based on those `EVENT_CREATED` entries.
+- **UI behavior:** Implement `showCreatedEventsSummary(reportEntries)` that:
+  - Calls `getCreatedEventsByGroup`.
+  - If the map is empty, shows: `Nie utworzono żadnych nowych wydarzeń w kalendarzu.`.
+  - Otherwise shows: `Utworzono wydarzenia w następujących grupach:` followed by one line per group in the form `- {groupName}: {count} wydarzenie/wydarzenia/wydarzeń` with simple Polish plural handling (1 → `wydarzenie`, 2–4 → `wydarzenia`, 5+ → `wydarzeń`).
+  - Uses `SpreadsheetApp.getUi().alert('Synchronizacja kalendarza', message, ui.ButtonSet.OK)` inside a `try/catch` so that time-driven or non-UI contexts don’t throw.
+- **When to show:** Call `showCreatedEventsSummary(reportEntries)` only on the successful path of `runSync`, after `writeRunReport(ss, reportEntries)`. Do not show the alert when `PHASE1_ONLY` is true or when a fatal error is caught.
+
+**Implementation summary (Automatyzacja_1.0):**
+
+- Added `getCreatedEventsByGroup(reportEntries)` near `makeReportEntry` / `writeRunReport`.
+- Added `showCreatedEventsSummary(reportEntries)` that builds and displays the alert.
+- Updated `runSync` so that, after writing the run report, it calls `showCreatedEventsSummary(reportEntries)` to surface this information to the user.
+
+**Result:** After a normal sync, users immediately see which groups had events created and how many per group, while detailed diagnostics remain in `Run_Report`. Background/trigger executions remain safe because the UI call is guarded.
+
+---
+
+## Calendar ID taken from sheet instead of hardcoded (creation + deletion tools)
+
+**Date:** 17.03.2026
+
+**Context:** Previously, both the main automation script (`Automatyzacja_1.0`) and the deletion tool (`Usuwanie_Wydarzen/Usuwanie_wydarzen_1.0`) had a hardcoded `CALENDAR_ID` with the full calendar address in the script source. The project now keeps the effective calendar ID in the schedule sheet (`Test_Schedule_Month_Script`) as a column `Calendar ID` (placed after `Nazwa Grupy`).
+
+**Goals:**
+
+- Make the calendar ID configurable from the sheet, without editing script source.
+- Avoid storing the real calendar address directly in code.
+- Keep behavior safe: fail fast with a clear error if no calendar ID is configured anywhere.
+
+**Decisions (Automatyzacja_1.0 – event creation):**
+
+- Added header constant: `HEADER_CALENDAR_ID = 'Calendar ID';`.
+- Added `getCalendarIdFromSheet(sheet)` that:
+  - Reads `sheet.getDataRange().getValues()`.
+  - Locates the `Calendar ID` column by header text (not by position).
+  - Returns the first non-empty cell value in that column (trimmed), or `null` if none.
+- In `runSync`:
+  - After resolving `scheduleSheet`, we compute:
+    - `var sheetCalendarId = getCalendarIdFromSheet(scheduleSheet);`
+    - `var calendarId = sheetCalendarId || CALENDAR_ID;`
+  - If `calendarId` is falsy, we throw:  
+    `Calendar ID is not configured. Please fill the "Calendar ID" column in sheet "Test_Schedule_Month_Script" or set CALENDAR_ID in the script.`
+  - We then call `CalendarApp.getCalendarById(calendarId)` and pass `calendarId` down into `upsertEventsForGroups`.
+- Updated `upsertEventsForGroups` signature to accept `calendarId`, and replaced usages where the raw string was needed:
+  - `getRecurringEventIdForSlotByListing(calendarId, ...)`
+  - `addTrialGuestToInstance(calendarId, ...)`
+- Adjusted config: `CALENDAR_ID` remains as a default but is now set to an empty string in code; the live ID is expected to come from the sheet.
+
+**Decisions (Usuwanie_wydarzen_1.0 – deletion tool):**
+
+- Config: replaced the hardcoded calendar address with an empty default:  
+  `var CALENDAR_ID = '';` with a comment explaining that the main source is the sheet `Calendar ID` column.
+- Introduced header + helper mirroring the main script:
+  - `HEADER_CALENDAR_ID_1_1 = 'Calendar ID';`
+  - `getCalendarIdFromSheet_1_1(sheet)`:
+    - Same logic: find `Calendar ID` header, return first non-empty cell in that column or `null`.
+- Updated `authorizeDeleteTool_1_1`:
+  - Computes `sheetCalendarId` and `calendarId = sheetCalendarId || CALENDAR_ID`.
+  - Throws a clear error if `calendarId` is missing, otherwise uses `CalendarApp.getCalendarById(calendarId)`.
+- Updated script-only entrypoint `deleteEventsByGroup_1_1`:
+  - Resolves `calendarId` from sheet/default in the same way, with the same “not configured” error message.
+  - Passes `calendarId` into `handleDeleteGroups_1_1(groupNames, calendarId)`.
+- Updated UI entrypoint `deleteEventsByGroup_1_1_withUi`:
+  - After validating user input, resolves `calendarId` via `getCalendarIdFromSheet_1_1`.
+  - If no `calendarId`, shows an alert to the user and aborts.
+  - Calls `handleDeleteGroups_1_1(selectedGroupNames, calendarId)`.
+- Updated `handleDeleteGroups_1_1`:
+  - Signature: `function handleDeleteGroups_1_1(selectedGroupNames, calendarId)`.
+  - Uses `calendarId` when calling `CalendarApp.getCalendarById(calendarId)` and in error messages, instead of the global `CALENDAR_ID`.
+
+**Result:**
+
+- Both the creation and deletion flows get their effective calendar ID from the sheet’s `Calendar ID` column, falling back to `CALENDAR_ID` only if explicitly configured in code (now empty by default).
+- No real calendar address is stored in the repository; the sheet is the primary configuration surface.
+- Errors are explicit when no calendar ID is configured, which should make misconfiguration easy to diagnose.

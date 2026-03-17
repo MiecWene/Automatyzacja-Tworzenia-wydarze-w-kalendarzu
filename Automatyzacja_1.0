@@ -5,8 +5,8 @@
 // Require Calendar Advanced Service (Extensions > Advanced Google Services > Google Calendar API)
 // for adding trial guests to a single occurrence via Calendar.Events.instances + patch.
 
-// Calendar id from the spec
-var CALENDAR_ID = 'c16cb7e33da24f0de52777487619b3ec0f91d88acf84d6dc96b7f482590d808f@group.calendar.google.com';
+// Calendar id default (kept empty; main source is the sheet `Calendar ID` column)
+var CALENDAR_ID = '';
 
 // Sheet and tab names
 var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
@@ -35,6 +35,13 @@ function runSync() {
       throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
     }
 
+    var sheetCalendarId = getCalendarIdFromSheet(scheduleSheet);
+    var calendarId = sheetCalendarId || CALENDAR_ID;
+    if (!calendarId) {
+      throw new Error('Calendar ID is not configured. Please fill the \"Calendar ID\" column in sheet \"' +
+        SCHEDULE_SHEET_NAME + '\" or set CALENDAR_ID in the script.');
+    }
+
     var rawRows = readScheduleRows(scheduleSheet);
     var validation = validateAndGroup(rawRows, reportEntries);
 
@@ -45,12 +52,12 @@ function runSync() {
     }
 
     // Phase 2/3/4: calendar operations + more report entries
-    var calendar = CalendarApp.getCalendarById(CALENDAR_ID);
+    var calendar = CalendarApp.getCalendarById(calendarId);
     if (!calendar) {
-      throw new Error('Calendar with id ' + CALENDAR_ID + ' not found or not accessible');
+      throw new Error('Calendar with id ' + calendarId + ' not found or not accessible');
     }
 
-    upsertEventsForGroups(calendar, validation, reportEntries);
+    upsertEventsForGroups(calendar, validation, reportEntries, calendarId);
 
     // Finally write the run report
     writeRunReport(ss, reportEntries);
@@ -84,6 +91,7 @@ function runSync() {
 
 var HEADER_EMAIL = 'Uczestnik (Email)';
 var HEADER_GROUP = 'Nazwa Grupy';
+var HEADER_CALENDAR_ID = 'Calendar ID';
 var HEADER_START_DATE = 'Data startu';
 var HEADER_END_DATE = 'Data końca';
 var HEADER_DAY1 = 'Dzień #1';
@@ -123,6 +131,32 @@ function readScheduleRows(sheet) {
     });
   }
   return result;
+}
+
+function getCalendarIdFromSheet(sheet) {
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return null;
+
+  var headerRow = values[0];
+  var calendarColIndex = -1;
+
+  for (var c = 0; c < headerRow.length; c++) {
+    if (String(headerRow[c]) === HEADER_CALENDAR_ID) {
+      calendarColIndex = c;
+      break;
+    }
+  }
+
+  if (calendarColIndex === -1) return null;
+
+  for (var r = 1; r < values.length; r++) {
+    var cell = values[r][calendarColIndex];
+    if (cell !== '' && cell != null) {
+      return String(cell).trim();
+    }
+  }
+
+  return null;
 }
 
 function validateAndGroup(rawRows, reportEntries) {
@@ -565,7 +599,7 @@ function runWithCalendarRetry(fn) {
   throw lastErr;
 }
 
-function upsertEventsForGroups(calendar, validation, reportEntries) {
+function upsertEventsForGroups(calendar, validation, reportEntries, calendarId) {
   validation.validGroups.forEach(function(bucket) {
     var parts = partitionParticipants(bucket);
     var seriesParticipants = parts.seriesParticipants;
@@ -659,7 +693,7 @@ function upsertEventsForGroups(calendar, validation, reportEntries) {
         }
 
         var recurringEventIdForSlot = getRecurringEventIdForSlotByListing(
-          CALENDAR_ID,
+          calendarId,
           bucket.groupName,
           matchingSlot,
           bucket.schedule.startDate,
@@ -679,7 +713,7 @@ function upsertEventsForGroups(calendar, validation, reportEntries) {
         }
 
         addTrialGuestToInstance(
-          CALENDAR_ID,
+          calendarId,
           recurringEventIdForSlot,
           row.trialDate,
           row.participantEmail,
