@@ -1055,3 +1055,16 @@ Across all versions, the **core invariant** is preserved: for each chosen group 
 - Both the creation and deletion flows get their effective calendar ID from the sheet’s `Calendar ID` column, falling back to `CALENDAR_ID` only if explicitly configured in code (now empty by default).
 - No real calendar address is stored in the repository; the sheet is the primary configuration surface.
 - Errors are explicit when no calendar ID is configured, which should make misconfiguration easy to diagnose.
+
+---
+
+## Entry – 18.03.2026
+
+**Context**: `Automatyzacja_1.0` calendar `description` was rendering “Classroom board” twice:
+- once as plain text in `RAW_TEMPLATE` (`You will work with the miro board Classroom board`)
+- and again as the hyperlink produced by `{link do Miro}` (with link text “Classroom board”).
+
+**Fix / decision**: Update `RAW_TEMPLATE` to remove the plain-text “Classroom board” wording so `{link do Miro}` remains the single source of that label and hyperlink in the final description.
+
+**Files affected**:
+- `Automatyzacja_1.0` – `RAW_TEMPLATE` / `renderInvitationBody()` for Miro link rendering.

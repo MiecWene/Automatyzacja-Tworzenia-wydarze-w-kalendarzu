@@ -9,7 +9,7 @@
 var CALENDAR_ID = '';
 
 // Sheet and tab names
-var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
+var SCHEDULE_SHEET_NAME = 'Schedule_Month_Script';
 var REPORT_SHEET_NAME = 'Run_Report';
 
 // Behavior toggles
@@ -100,7 +100,7 @@ var HEADER_DAY2 = 'Dzień #2';
 var HEADER_TIME2 = 'Godzina #2 (hh:mm)';
 var HEADER_CONFIRMED = 'Confirmed';
 var HEADER_TRIAL_DATE = 'Data zajęć próbnych';
-var HEADER_ZOOM = 'Zoom link';
+var HEADER_ZOOM = 'Link zoom z bazy';
 var HEADER_TEACHER = 'Nauczyciel';
 var HEADER_DROPBOX = 'Link do dropbox';
 var HEADER_MIRO = 'Link do Miro';
@@ -553,22 +553,55 @@ var RAW_TEMPLATE = '' +
 '{{zoom link}}\n\n' +
 'Your teacher\'s name is {{Nauczyciel}}.\n' +
 'All lessons are recorded so you can rewatch them to review the material or in case you skipped one.\n\n' +
-'You can watch them here\n' +
 '{{to ma hyperlink do Dropbox}}\n\n' +
-'You will work with the miro board Classroom board\n' +
+'You will work with the miro board\n' +
 '{link do Miro}';
 
 function renderInvitationBody(row) {
   var body = RAW_TEMPLATE;
 
-  body = body.replace('{{zoom link}}', row.zoomLink || '');
+  function escapeHtmlText(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  // Escape values for safe inclusion into HTML attributes (Calendar description supports basic HTML).
+  function escapeHtmlAttribute(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function splitMultiLinks(cellValue) {
+    if (cellValue == null) return [];
+    if (typeof cellValue !== 'string') return [];
+    return cellValue
+      .split(/[\n,;]+/g)
+      .map(function(x) { return x.trim(); })
+      .filter(function(x) { return x.length > 0; });
+  }
+
+  function renderAnchors(cellValue, linkText) {
+    var links = splitMultiLinks(cellValue);
+    if (links.length === 0) return '';
+    return links.map(function(href, idx) {
+      var text = links.length > 1 ? (linkText + ' ' + (idx + 1)) : linkText;
+      return '<a href="' + escapeHtmlAttribute(href) + '">' + escapeHtmlText(text) + '</a>';
+    }).join('<br/>');
+  }
+
+  body = body.replace('{{zoom link}}', renderAnchors(row.zoomLink || '', 'Zoom link'));
   body = body.replace('{{Nauczyciel}}', row.teacherName || '');
 
-  var dropbox = row.dropboxLink || '';
-  var hyperlink = '<a href="' + dropbox + '">You can watch them here</a>';
-  body = body.replace('{{to ma hyperlink do Dropbox}}', hyperlink);
+  body = body.replace('{{to ma hyperlink do Dropbox}}',
+    renderAnchors(row.dropboxLink || '', 'You can watch them here'));
 
-  body = body.replace('{link do Miro}', row.miroLink || '');
+  body = body.replace('{link do Miro}', renderAnchors(row.miroLink || '', 'Classroom board'));
 
   return body;
 }
