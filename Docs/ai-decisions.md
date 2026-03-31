@@ -1068,3 +1068,44 @@ Across all versions, the **core invariant** is preserved: for each chosen group 
 
 **Files affected**:
 - `Automatyzacja_1.0` – `RAW_TEMPLATE` / `renderInvitationBody()` for Miro link rendering.
+
+---
+
+## Rerun-safe sync: managed series identity, future-only guests, obsolete future cleanup (memory)
+
+**Date:** 01.04.2026
+
+**Context (problem / user intent):**
+
+- Users rerun `runSync()` after changing the sheet; they expect **existing** recurring series to be **updated** (time, recurrence, description, attendees) rather than duplicated.
+- **Deletion / cleanup** must **not remove past lessons**: only cancel or remove what **would still occur in the future** when a group/slot disappears from the sheet.
+- **Guest list changes** must **not** be applied in a way that strips invitees from **past** occurrences. Google Calendar often applies `addGuest` / `removeGuest` on the **whole** recurring series, which can revoke access to historical instances (including links in the event body). Confirmed attendees should be reconciled **only on future instances**, and if there are **no future instances**, guest sync should be skipped.
+
+**Goals:**
+
+1. Reliable matching of sheet rows to calendar series (avoid ambiguous title-only matches where possible).
+2. Update series via `CalendarApp` for time/recurrence/description; sync attendees via **Calendar API** on **future instances only**.
+3. After sync, **orphan** managed series (no longer present in the sheet) get **future-only** cleanup: trim `RRULE` `UNTIL` after the last past occurrence, or delete the master only when **all** instances are still in the future.
+4. Keep trial flow **add-only** on single occurrences; no trial guest removals.
+
+**Design decisions:**
+
+- **Stable identity:** Store a deterministic private extended property on the **recurring master** (Calendar API v3), e.g. key `atwkManagedSeries_v1`, value `v1|group|weekday|hour|minute|slotIndex` (pipe in group name escaped). Lookup via `Calendar.Events.list` with `privateExtendedProperty=key=value`.
+- **Legacy series:** If no property yet, fall back to existing `findExistingGroupSeriesForSlot` / `findExistingGroupSeries`, log `SERIES_MATCHED_LEGACY_FALLBACK`, then **patch** the master to set the managed property so the next run is stable. If `CalendarApp.getEventById(iCalUID)` fails, fall back to scanning `calendar.getEvents` for matching `getId() === iCalUID`.
+- **Upsert flow:** `upsertSlotSeries` registers each active slot’s managed value in `desiredManagedKeys`; `runSync` calls `cleanupObsoleteManagedSeries` after upserts.
+- **Guests:** `updateSeries` **does not** call `series.addGuest` / `removeGuest`. Use `syncFutureInstanceAttendees`: paginate `Calendar.Events.instances` from **now**, and for each future instance `patch` `attendees` to the desired confirmed set while preserving the organizer. Report `GUESTS_SYNC_FUTURE_ONLY_APPLIED`, `GUESTS_SYNC_SKIPPED_NO_FUTURE`, or `GUESTS_SYNC_FUTURE_ONLY_FAILED`.
+- **Obsolete cleanup:** List masters with the private key (property name only, any value). For values **not** in `desiredManagedKeys`: if there is **no** future instance, do nothing; if **all** instances are future-only, `Calendar.Events.remove` the master; if there are **past** instances, `patch` recurrence with a new `RRULE` `UNTIL` derived from the **end** of the last past instance (strip prior `UNTIL`/`COUNT`, append new `UNTIL` in UTC `yyyyMMdd'T'HHmmss'Z'`). Optional `OBSOLETE_SERIES_CLEANUP_DRY_RUN` logs intent without mutating.
+- **Trials:** Resolve recurring id with `getRecurringApiIdManagedOrSlot` (managed key first, then title/slot listing).
+
+**Implementation summary (`Automatyzacja_1.0`):**
+
+- Config: `MANAGED_SERIES_PRIVATE_KEY`, `OBSOLETE_SERIES_CLEANUP_DRY_RUN`.
+- Helpers: `buildManagedSeriesPrivateValue`, `findRecurringMasterByManagedPrivate`, `ensureManagedSeriesExtendedProps`, `apiRecurringIdToEventSeries`, `findCalendarAppSeriesByIcalUid`, `upsertSlotSeries`, `syncFutureInstanceAttendees`, `buildRecurrenceTrimmedToUntil`, `trimOrDeleteObsoleteManagedSeries`, `cleanupObsoleteManagedSeries`, `getRecurringApiIdManagedOrSlot`, `slotIndexInSchedule`.
+- `createSeries` takes `calendarId` + `managedValue`, tags master after create.
+- `runSync`: `desiredManagedKeys` → `upsertEventsForGroups` → `cleanupObsoleteManagedSeries`.
+
+**Report actions to look for:** `SERIES_MATCHED_BY_MANAGED_KEY`, `SERIES_MATCHED_LEGACY_FALLBACK`, `GUESTS_SYNC_*`, `OBSOLETE_SERIES_FUTURE_TRIMMED`, `OBSOLETE_SERIES_REMOVED_FUTURE_ONLY`, `OBSOLETE_SERIES_CLEANUP_FAILED`.
+
+**Caveat (for future readers):** `series.setDescription` still updates the **series** description in Calendar; Google may propagate description changes across instances. This memory’s hard requirement was **guests on past instances**, not freezing past description text.
+
+**Cursor / AI:** Read this entry before changing rerun behavior, guest sync, or obsolete-series cleanup in `Automatyzacja_1.0`.

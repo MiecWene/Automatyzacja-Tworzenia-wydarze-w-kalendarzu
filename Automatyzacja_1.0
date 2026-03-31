@@ -20,6 +20,12 @@ var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = false; // BEH-11: skip groups wi
 var CALENDAR_RETRY_ATTEMPTS = 3;
 var CALENDAR_RETRY_DELAY_MS = 2500;
 
+// Managed recurring series: private extended property on the master event (Calendar API v3)
+var MANAGED_SERIES_PRIVATE_KEY = 'atwkManagedSeries_v1';
+
+// If true, obsolete-series cleanup only logs what it would do (no delete/trim)
+var OBSOLETE_SERIES_CLEANUP_DRY_RUN = false;
+
 /******************************
  * ENTRYPOINT
  ******************************/
@@ -57,7 +63,9 @@ function runSync() {
       throw new Error('Calendar with id ' + calendarId + ' not found or not accessible');
     }
 
-    upsertEventsForGroups(calendar, validation, reportEntries, calendarId);
+    var desiredManagedKeys = {};
+    upsertEventsForGroups(calendar, validation, reportEntries, calendarId, desiredManagedKeys);
+    cleanupObsoleteManagedSeries(calendarId, desiredManagedKeys, reportEntries);
 
     // Finally write the run report
     writeRunReport(ss, reportEntries);
@@ -632,7 +640,491 @@ function runWithCalendarRetry(fn) {
   throw lastErr;
 }
 
-function upsertEventsForGroups(calendar, validation, reportEntries, calendarId) {
+function escapeManagedSeriesSegment(s) {
+  return String(s).replace(/\|/g, '_');
+}
+
+/**
+ * Stable id for a group's recurring slot; stored in Calendar extendedProperties.private.
+ */
+function buildManagedSeriesPrivateValue(groupName, slot, slotIndex) {
+  return [
+    'v1',
+    escapeManagedSeriesSegment(groupName),
+    slot.weekday,
+    String(slot.time.hour),
+    String(slot.time.minute),
+    String(slotIndex)
+  ].join('|');
+}
+
+function slotIndexInSchedule(slots, slot) {
+  for (var i = 0; i < slots.length; i++) {
+    var s = slots[i];
+    if (s && s.weekday === slot.weekday && s.time.hour === slot.time.hour && s.time.minute === slot.time.minute) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+function findRecurringMasterByManagedPrivate(calendarId, managedValue, schedule) {
+  try {
+    var startWindow = new Date(schedule.startDate.getTime());
+    startWindow.setDate(startWindow.getDate() - 21);
+    var endWindow = new Date(schedule.endDate.getTime());
+    endWindow.setDate(endWindow.getDate() + 21);
+    var response = Calendar.Events.list(calendarId, {
+      timeMin: startWindow.toISOString(),
+      timeMax: startOfNextDay(endWindow).toISOString(),
+      singleEvents: false,
+      privateExtendedProperty: MANAGED_SERIES_PRIVATE_KEY + '=' + managedValue
+    });
+    var items = response.items || [];
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (item.status === 'cancelled') continue;
+      if (!item.recurrence) continue;
+      return item;
+    }
+  } catch (e) {
+    // fall through
+  }
+  return null;
+}
+
+function ensureManagedSeriesExtendedProps(calendarId, recurringMasterId, managedValue) {
+  if (!recurringMasterId || !managedValue) return;
+  runWithCalendarRetry(function() {
+    var ev = Calendar.Events.get(calendarId, recurringMasterId);
+    var priv = (ev.extendedProperties && ev.extendedProperties.private) || {};
+    if (priv[MANAGED_SERIES_PRIVATE_KEY] === managedValue) return;
+    priv[MANAGED_SERIES_PRIVATE_KEY] = managedValue;
+    Calendar.Events.patch({
+      extendedProperties: { private: priv }
+    }, calendarId, recurringMasterId, { sendUpdates: 'none' });
+  });
+}
+
+function apiRecurringIdToEventSeries(calendarId, recurringMasterId) {
+  try {
+    var ev = Calendar.Events.get(calendarId, recurringMasterId);
+    if (!ev || !ev.iCalUID) return null;
+    var calEvent = CalendarApp.getEventById(ev.iCalUID);
+    if (!calEvent || !calEvent.isRecurringEvent()) return null;
+    return calEvent.getEventSeries();
+  } catch (e) {
+    return null;
+  }
+}
+
+function findCalendarAppSeriesByIcalUid(calendar, iCalUid, schedule) {
+  if (!iCalUid) return null;
+  var startWindow = new Date(schedule.startDate.getTime());
+  startWindow.setDate(startWindow.getDate() - 14);
+  var endWindow = new Date(schedule.endDate.getTime());
+  endWindow.setDate(endWindow.getDate() + 14);
+  var events = calendar.getEvents(startWindow, endWindow);
+  for (var i = 0; i < events.length; i++) {
+    var e = events[i];
+    if (!e.isRecurringEvent()) continue;
+    try {
+      if (e.getId() === iCalUid) return e.getEventSeries();
+    } catch (e2) {
+      // continue
+    }
+  }
+  return null;
+}
+
+function getRecurringApiIdManagedOrSlot(calendarId, groupName, slot, startDate, endDate, managedValue) {
+  if (managedValue) {
+    var schedule = { startDate: startDate, endDate: endDate };
+    var master = findRecurringMasterByManagedPrivate(calendarId, managedValue, schedule);
+    if (master && master.id) return master.id;
+  }
+  return getRecurringEventIdForSlotByListing(calendarId, groupName, slot, startDate, endDate);
+}
+
+function attendeeEmailsLower(attendees) {
+  var out = [];
+  var list = attendees || [];
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i];
+    if (a.organizer) continue;
+    if (a.email) out.push(String(a.email).toLowerCase());
+  }
+  out.sort();
+  return out;
+}
+
+function buildAttendeesForFutureInstance(currentAttendees, desiredEmails) {
+  var desiredLower = {};
+  for (var d = 0; d < desiredEmails.length; d++) {
+    desiredLower[String(desiredEmails[d]).toLowerCase()] = desiredEmails[d];
+  }
+  var out = [];
+  var seenLower = {};
+  var cur = currentAttendees || [];
+  for (var i = 0; i < cur.length; i++) {
+    var a = cur[i];
+    if (a.organizer) {
+      out.push(a);
+      continue;
+    }
+    var lo = a.email ? String(a.email).toLowerCase() : '';
+    if (desiredLower.hasOwnProperty(lo)) {
+      out.push(a);
+      seenLower[lo] = true;
+    }
+  }
+  for (var lo2 in desiredLower) {
+    if (!desiredLower.hasOwnProperty(lo2)) continue;
+    if (!seenLower[lo2]) {
+      out.push({ email: desiredLower[lo2] });
+    }
+  }
+  return out;
+}
+
+function attendeesListsEquivalentForGuests(a, b) {
+  return attendeeEmailsLower(a).join(',') === attendeeEmailsLower(b).join(',');
+}
+
+/**
+ * Sets attendee list on each future occurrence only (past instances unchanged).
+ */
+function syncFutureInstanceAttendees(calendarId, recurringEventId, desiredEmails, reportEntries, groupName) {
+  if (!recurringEventId) {
+    reportEntries.push(makeReportEntry({
+      action: 'GUESTS_SYNC_SKIPPED_NO_FUTURE',
+      groupName: groupName,
+      details: 'No recurring event id; guest sync skipped'
+    }));
+    return;
+  }
+  var now = new Date();
+  var timeMin = now.toISOString();
+  var timeMax = new Date(now.getFullYear() + 3, 11, 31).toISOString();
+  var pageToken;
+  var patched = 0;
+  var futureCount = 0;
+  try {
+    do {
+      var resp = runWithCalendarRetry(function() {
+        return Calendar.Events.instances(calendarId, recurringEventId, {
+          timeMin: timeMin,
+          timeMax: timeMax,
+          maxResults: 250,
+          pageToken: pageToken || undefined
+        });
+      });
+      var items = resp.items || [];
+      for (var i = 0; i < items.length; i++) {
+        var inst = items[i];
+        if (inst.status === 'cancelled') continue;
+        var startField = inst.start && (inst.start.dateTime || inst.start.date);
+        if (!startField) continue;
+        var startDt = new Date(startField);
+        if (startDt.getTime() < now.getTime()) continue;
+        futureCount++;
+        var nextAtt = buildAttendeesForFutureInstance(inst.attendees, desiredEmails);
+        if (!attendeesListsEquivalentForGuests(inst.attendees, nextAtt)) {
+          runWithCalendarRetry(function() {
+            Calendar.Events.patch({
+              attendees: nextAtt
+            }, calendarId, inst.id, { sendUpdates: 'none' });
+          });
+          patched++;
+        }
+      }
+      pageToken = resp.nextPageToken;
+    } while (pageToken);
+
+    if (futureCount === 0) {
+      reportEntries.push(makeReportEntry({
+        action: 'GUESTS_SYNC_SKIPPED_NO_FUTURE',
+        groupName: groupName,
+        details: 'No future instances; guest list not changed'
+      }));
+    } else {
+      reportEntries.push(makeReportEntry({
+        action: 'GUESTS_SYNC_FUTURE_ONLY_APPLIED',
+        groupName: groupName,
+        details: 'Future instances: ' + futureCount + ', attendee patches: ' + patched + ', desired guests: ' + desiredEmails.length
+      }));
+    }
+  } catch (e) {
+    reportEntries.push(makeReportEntry({
+      action: 'GUESTS_SYNC_FUTURE_ONLY_FAILED',
+      groupName: groupName,
+      details: 'Future guest sync failed',
+      errorReason: String(e)
+    }));
+  }
+}
+
+function toRruleUntilUtcFromEnd(endField) {
+  var d = new Date(endField);
+  if (isNaN(d.getTime())) return null;
+  return Utilities.formatDate(d, 'UTC', "yyyyMMdd'T'HHmmss'Z'");
+}
+
+function buildRecurrenceTrimmedToUntil(originalRecurrence, untilUtc) {
+  if (!originalRecurrence || originalRecurrence.length === 0 || !untilUtc) return originalRecurrence;
+  var rruleLine = null;
+  for (var r = 0; r < originalRecurrence.length; r++) {
+    if (String(originalRecurrence[r]).indexOf('RRULE:') === 0) {
+      rruleLine = originalRecurrence[r];
+      break;
+    }
+  }
+  if (!rruleLine) return originalRecurrence;
+  var body = rruleLine.substring(6);
+  var parts = body.split(';');
+  var newParts = [];
+  for (var i = 0; i < parts.length; i++) {
+    var p = parts[i];
+    if (!p) continue;
+    if (p.indexOf('UNTIL=') === 0) continue;
+    if (p.indexOf('COUNT=') === 0) continue;
+    newParts.push(p);
+  }
+  newParts.push('UNTIL=' + untilUtc);
+  var other = [];
+  for (var j = 0; j < originalRecurrence.length; j++) {
+    if (String(originalRecurrence[j]).indexOf('RRULE:') !== 0) {
+      other.push(originalRecurrence[j]);
+    }
+  }
+  return other.concat(['RRULE:' + newParts.join(';')]);
+}
+
+function seriesHasFutureInstances(calendarId, recurringEventId, fromDate) {
+  var timeMin = fromDate.toISOString();
+  var timeMax = new Date(fromDate.getFullYear() + 3, 11, 31).toISOString();
+  try {
+    var resp = Calendar.Events.instances(calendarId, recurringEventId, {
+      timeMin: timeMin,
+      timeMax: timeMax,
+      maxResults: 1
+    });
+    return (resp.items && resp.items.length > 0);
+  } catch (e) {
+    return false;
+  }
+}
+
+function getLastPastInstance(calendarId, recurringEventId, seriesStartIso, asOfDate) {
+  var timeMax = asOfDate.toISOString();
+  var pageToken;
+  var last = null;
+  try {
+    do {
+      var resp = Calendar.Events.instances(calendarId, recurringEventId, {
+        timeMin: seriesStartIso,
+        timeMax: timeMax,
+        maxResults: 250,
+        pageToken: pageToken || undefined
+      });
+      var items = resp.items || [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (it.status === 'cancelled') continue;
+        last = it;
+      }
+      pageToken = resp.nextPageToken;
+    } while (pageToken);
+  } catch (e) {
+    return null;
+  }
+  return last;
+}
+
+function trimOrDeleteObsoleteManagedSeries(calendarId, recurringEventId, reportEntries, summaryForLog) {
+  var now = new Date();
+  var master;
+  try {
+    master = Calendar.Events.get(calendarId, recurringEventId);
+  } catch (e) {
+    reportEntries.push(makeReportEntry({
+      action: 'OBSOLETE_SERIES_CLEANUP_FAILED',
+      groupName: '',
+      details: summaryForLog || recurringEventId,
+      errorReason: String(e)
+    }));
+    return;
+  }
+  if (!master.recurrence) return;
+
+  var seriesStart = (master.start && (master.start.dateTime || master.start.date)) || now.toISOString();
+  if (!seriesHasFutureInstances(calendarId, recurringEventId, now)) {
+    return;
+  }
+
+  var lastPast = getLastPastInstance(calendarId, recurringEventId, seriesStart, now);
+  if (!lastPast) {
+    if (OBSOLETE_SERIES_CLEANUP_DRY_RUN) {
+      reportEntries.push(makeReportEntry({
+        action: 'OBSOLETE_SERIES_REMOVED_FUTURE_ONLY',
+        details: '(dry-run) Would delete all-future obsolete series: ' + (summaryForLog || recurringEventId)
+      }));
+      return;
+    }
+    try {
+      runWithCalendarRetry(function() {
+        Calendar.Events.remove(calendarId, recurringEventId);
+      });
+      reportEntries.push(makeReportEntry({
+        action: 'OBSOLETE_SERIES_REMOVED_FUTURE_ONLY',
+        details: 'Deleted obsolete managed series (no past instances): ' + (summaryForLog || recurringEventId)
+      }));
+    } catch (e) {
+      reportEntries.push(makeReportEntry({
+        action: 'OBSOLETE_SERIES_CLEANUP_FAILED',
+        details: summaryForLog || recurringEventId,
+        errorReason: String(e)
+      }));
+    }
+    return;
+  }
+
+  var endField = lastPast.end && (lastPast.end.dateTime || lastPast.end.date);
+  if (!endField) return;
+  var untilUtc = toRruleUntilUtcFromEnd(endField);
+  if (!untilUtc) return;
+  var newRec = buildRecurrenceTrimmedToUntil(master.recurrence, untilUtc);
+  if (OBSOLETE_SERIES_CLEANUP_DRY_RUN) {
+    reportEntries.push(makeReportEntry({
+      action: 'OBSOLETE_SERIES_FUTURE_TRIMMED',
+      details: '(dry-run) Would trim recurrence UNTIL=' + untilUtc + ' for ' + (summaryForLog || recurringEventId)
+    }));
+    return;
+  }
+  try {
+    runWithCalendarRetry(function() {
+      Calendar.Events.patch({
+        recurrence: newRec
+      }, calendarId, recurringEventId, { sendUpdates: 'none' });
+    });
+    reportEntries.push(makeReportEntry({
+      action: 'OBSOLETE_SERIES_FUTURE_TRIMMED',
+      details: 'Trimmed obsolete series to last past occurrence; UNTIL=' + untilUtc + ' ' + (summaryForLog || '')
+    }));
+  } catch (e) {
+    reportEntries.push(makeReportEntry({
+      action: 'OBSOLETE_SERIES_CLEANUP_FAILED',
+      details: summaryForLog || recurringEventId,
+      errorReason: String(e)
+    }));
+  }
+}
+
+function upsertSlotSeries(calendar, calendarId, bucket, slot, slotIndex, seriesEmails, description, reportEntries, desiredManagedKeys) {
+  var managedValue = buildManagedSeriesPrivateValue(bucket.groupName, slot, slotIndex);
+  var masterItem = findRecurringMasterByManagedPrivate(calendarId, managedValue, bucket.schedule);
+  var seriesApp = null;
+  var recurringApiId = null;
+  var matchedManaged = false;
+
+  if (masterItem && masterItem.id) {
+    matchedManaged = true;
+    recurringApiId = masterItem.id;
+    seriesApp = apiRecurringIdToEventSeries(calendarId, masterItem.id);
+    if (!seriesApp) {
+      try {
+        var evMeta = Calendar.Events.get(calendarId, masterItem.id);
+        if (evMeta && evMeta.iCalUID) {
+          seriesApp = findCalendarAppSeriesByIcalUid(calendar, evMeta.iCalUID, bucket.schedule);
+        }
+      } catch (eMeta) {
+        // fall through to legacy search
+      }
+    }
+    reportEntries.push(makeReportEntry({
+      action: 'SERIES_MATCHED_BY_MANAGED_KEY',
+      groupName: bucket.groupName,
+      details: 'slot ' + slotIndex + ' managed=' + managedValue
+    }));
+  }
+
+  if (!seriesApp) {
+    seriesApp = findExistingGroupSeriesForSlot(calendar, bucket, slot);
+    if (!seriesApp && slotIndex === 0) {
+      seriesApp = findExistingGroupSeries(calendar, bucket);
+    }
+    if (seriesApp) {
+      if (!matchedManaged) {
+        reportEntries.push(makeReportEntry({
+          action: 'SERIES_MATCHED_LEGACY_FALLBACK',
+          groupName: bucket.groupName,
+          details: 'slot ' + slotIndex
+        }));
+      }
+      if (!recurringApiId) {
+        recurringApiId = getRecurringEventIdForSlotByListing(calendarId, bucket.groupName, slot, bucket.schedule.startDate, bucket.schedule.endDate);
+      }
+      if (recurringApiId) {
+        ensureManagedSeriesExtendedProps(calendarId, recurringApiId, managedValue);
+      }
+    }
+  }
+
+  desiredManagedKeys[managedValue] = true;
+
+  if (seriesApp) {
+    updateSeries(calendar, seriesApp, bucket, slot, seriesEmails, description, reportEntries, calendarId, recurringApiId);
+    return { series: seriesApp, created: false };
+  }
+  var created = createSeries(calendar, bucket, slot, seriesEmails, description, reportEntries, calendarId, managedValue);
+  return { series: created, created: true };
+}
+
+/**
+ * Removes future occurrences for managed series that are no longer present in the sheet.
+ */
+function cleanupObsoleteManagedSeries(calendarId, desiredManagedKeys, reportEntries) {
+  var now = new Date();
+  var timeMin = new Date(now.getFullYear() - 2, 0, 1).toISOString();
+  var timeMax = new Date(now.getFullYear() + 2, 11, 31).toISOString();
+  var pageToken;
+  var seenId = {};
+  try {
+    do {
+      var resp = Calendar.Events.list(calendarId, {
+        timeMin: timeMin,
+        timeMax: timeMax,
+        maxResults: 250,
+        pageToken: pageToken || undefined,
+        singleEvents: false,
+        privateExtendedProperty: MANAGED_SERIES_PRIVATE_KEY
+      });
+      var items = resp.items || [];
+      for (var i = 0; i < items.length; i++) {
+        var item = items[i];
+        if (item.status === 'cancelled') continue;
+        if (!item.recurrence || !item.id) continue;
+        if (seenId[item.id]) continue;
+        seenId[item.id] = true;
+        var priv = item.extendedProperties && item.extendedProperties.private;
+        if (!priv || !priv[MANAGED_SERIES_PRIVATE_KEY]) continue;
+        var val = priv[MANAGED_SERIES_PRIVATE_KEY];
+        if (desiredManagedKeys[val]) continue;
+        var logLabel = item.summary + ' [' + val + ']';
+        trimOrDeleteObsoleteManagedSeries(calendarId, item.id, reportEntries, logLabel);
+      }
+      pageToken = resp.nextPageToken;
+    } while (pageToken);
+  } catch (e) {
+    reportEntries.push(makeReportEntry({
+      action: 'OBSOLETE_SERIES_CLEANUP_FAILED',
+      details: 'cleanupObsoleteManagedSeries list/pagination',
+      errorReason: String(e)
+    }));
+  }
+}
+
+function upsertEventsForGroups(calendar, validation, reportEntries, calendarId, desiredManagedKeys) {
   validation.validGroups.forEach(function(bucket) {
     var parts = partitionParticipants(bucket);
     var seriesParticipants = parts.seriesParticipants;
@@ -664,30 +1156,17 @@ function upsertEventsForGroups(calendar, validation, reportEntries, calendarId) 
 
     // Primary slot (Dzień #1 / Godzina #1)
     var primarySlot = slots[0];
-    var existingSeriesPrimary = findExistingGroupSeriesForSlot(calendar, bucket, primarySlot) || findExistingGroupSeries(calendar, bucket);
-    var primarySeries;
-    if (existingSeriesPrimary) {
-      updateSeries(calendar, existingSeriesPrimary, bucket, primarySlot, seriesEmails, description, reportEntries);
-      primarySeries = existingSeriesPrimary;
-    } else {
-      primarySeries = createSeries(calendar, bucket, primarySlot, seriesEmails, description, reportEntries);
-    }
+    var primaryResult = upsertSlotSeries(calendar, calendarId, bucket, primarySlot, 0, seriesEmails, description, reportEntries, desiredManagedKeys);
+    var primarySeries = primaryResult.series;
 
     // Secondary slot (Dzień #2 / Godzina #2) if present
     if (slots.length > 1 && slots[1] && slots[1].weekday && slots[1].time) {
-      var secondarySlot = slots[1];
-      var existingSeriesSecondary = findExistingGroupSeriesForSlot(calendar, bucket, secondarySlot);
-      if (existingSeriesSecondary) {
-        updateSeries(calendar, existingSeriesSecondary, bucket, secondarySlot, seriesEmails, description, reportEntries);
-      } else {
-        createSeries(calendar, bucket, secondarySlot, seriesEmails, description, reportEntries);
-      }
+      upsertSlotSeries(calendar, calendarId, bucket, slots[1], 1, seriesEmails, description, reportEntries, desiredManagedKeys);
     }
 
     // Trial participants: attach to the correct series (slot) based on the trial date weekday
     if (trialParticipants.length > 0) {
-      if (primarySeries && !existingSeriesPrimary) {
-        // Give API a moment to index newly created series
+      if (primaryResult.created) {
         Utilities.sleep(1500);
       }
 
@@ -725,12 +1204,15 @@ function upsertEventsForGroups(calendar, validation, reportEntries, calendarId) 
           return;
         }
 
-        var recurringEventIdForSlot = getRecurringEventIdForSlotByListing(
+        var trialSlotIndex = slotIndexInSchedule(slots, matchingSlot);
+        var trialManagedValue = buildManagedSeriesPrivateValue(bucket.groupName, matchingSlot, trialSlotIndex);
+        var recurringEventIdForSlot = getRecurringApiIdManagedOrSlot(
           calendarId,
           bucket.groupName,
           matchingSlot,
           bucket.schedule.startDate,
-          bucket.schedule.endDate
+          bucket.schedule.endDate,
+          trialManagedValue
         );
 
         if (!recurringEventIdForSlot) {
@@ -827,7 +1309,7 @@ function alignDateToWeekday(baseDate, weekdayToken) {
   return d;
 }
 
-function createSeries(calendar, bucket, slot, emails, description, reportEntries) {
+function createSeries(calendar, bucket, slot, emails, description, reportEntries, calendarId, managedValue) {
   var schedule = bucket.schedule;
   var primarySlot = slot;
 
@@ -858,14 +1340,21 @@ function createSeries(calendar, bucket, slot, emails, description, reportEntries
     groupName: bucket.groupName,
     details: 'Created recurring event; attendees: ' + emails.length
   }));
+
+  if (calendarId && managedValue) {
+    Utilities.sleep(800);
+    var recurringId = getRecurringEventIdForSlotByListing(calendarId, bucket.groupName, slot, schedule.startDate, schedule.endDate);
+    if (recurringId) {
+      ensureManagedSeriesExtendedProps(calendarId, recurringId, managedValue);
+    }
+  }
+
   return eventSeries;
 }
 
-function updateSeries(calendar, series, bucket, slot, emails, description, reportEntries) {
-  // Update description always (idempotent enough)
+function updateSeries(calendar, series, bucket, slot, emails, description, reportEntries, calendarId, recurringApiId) {
   series.setDescription(description);
 
-  // Update recurrence if schedule changed: for simplicity, we always reset
   var schedule = bucket.schedule;
   var primarySlot = slot;
   var alignedStartDate = alignDateToWeekday(schedule.startDate, primarySlot.weekday);
@@ -882,28 +1371,15 @@ function updateSeries(calendar, series, bucket, slot, emails, description, repor
   runWithCalendarRetry(function() {
     series.setTime(start, end);
     series.setRecurrence(recurrence);
-
-    var currentGuests = series.getGuestList().map(function(g) { return g.getEmail(); });
-    var desired = {};
-    emails.forEach(function(e) { desired[e] = true; });
-
-    currentGuests.forEach(function(email) {
-      if (!desired[email]) {
-        series.removeGuest(email);
-      }
-    });
-
-    emails.forEach(function(email) {
-      if (currentGuests.indexOf(email) === -1) {
-        series.addGuest(email);
-      }
-    });
   });
+
+  var apiId = recurringApiId || getRecurringEventIdForSlotByListing(calendarId, bucket.groupName, slot, schedule.startDate, schedule.endDate);
+  syncFutureInstanceAttendees(calendarId, apiId, emails, reportEntries, bucket.groupName);
 
   reportEntries.push(makeReportEntry({
     action: 'EVENT_UPDATED',
     groupName: bucket.groupName,
-    details: 'Updated recurring event; attendees: ' + emails.length
+    details: 'Updated recurring event (time/recurrence/description); future-only guest sync applied separately'
   }));
 }
 
