@@ -879,9 +879,9 @@ function updateSeries(calendar, series, bucket, slot, emails, description, repor
   recurrence.onlyOnWeekday(toAppsScriptWeekday(primarySlot.weekday));
   recurrence.setTimeZone(Session.getScriptTimeZone());
 
+  // CalendarEventSeries has no setTime(); time is set via setRecurrence(recurrence, startTime, endTime).
   runWithCalendarRetry(function() {
-    series.setTime(start, end);
-    series.setRecurrence(recurrence);
+    series.setRecurrence(recurrence, start, end);
 
     var currentGuests = series.getGuestList().map(function(g) { return g.getEmail(); });
     var desired = {};
