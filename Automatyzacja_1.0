@@ -2,16 +2,23 @@
  * CONFIG
  ******************************/
 
-// Calendar id from the spec
-var CALENDAR_ID = 'c16cb7e33da24f0de52777487619b3ec0f91d88acf84d6dc96b7f482590d808f@group.calendar.google.com';
+// Require Calendar Advanced Service (Extensions > Advanced Google Services > Google Calendar API)
+// for adding trial guests to a single occurrence via Calendar.Events.instances + patch.
+
+// Calendar id default (kept empty; main source is the sheet `Calendar ID` column)
+var CALENDAR_ID = '';
 
 // Sheet and tab names
-var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
+var SCHEDULE_SHEET_NAME = 'Schedule_Month_Script';
 var REPORT_SHEET_NAME = 'Run_Report';
 
 // Behavior toggles
 var PHASE1_ONLY = false; // true = validation + reporting only, no calendar changes
-var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = true; // BEH-11 default
+var CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES = false; // BEH-11: skip groups with no confirmed (and no trial) participants
+
+// Retry for transient Calendar API errors (e.g. "Service unavailable: Calendar")
+var CALENDAR_RETRY_ATTEMPTS = 3;
+var CALENDAR_RETRY_DELAY_MS = 2500;
 
 /******************************
  * ENTRYPOINT
@@ -28,6 +35,13 @@ function runSync() {
       throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
     }
 
+    var sheetCalendarId = getCalendarIdFromSheet(scheduleSheet);
+    var calendarId = sheetCalendarId || CALENDAR_ID;
+    if (!calendarId) {
+      throw new Error('Calendar ID is not configured. Please fill the \"Calendar ID\" column in sheet \"' +
+        SCHEDULE_SHEET_NAME + '\" or set CALENDAR_ID in the script.');
+    }
+
     var rawRows = readScheduleRows(scheduleSheet);
     var validation = validateAndGroup(rawRows, reportEntries);
 
@@ -38,15 +52,18 @@ function runSync() {
     }
 
     // Phase 2/3/4: calendar operations + more report entries
-    var calendar = CalendarApp.getCalendarById(CALENDAR_ID);
+    var calendar = CalendarApp.getCalendarById(calendarId);
     if (!calendar) {
-      throw new Error('Calendar with id ' + CALENDAR_ID + ' not found or not accessible');
+      throw new Error('Calendar with id ' + calendarId + ' not found or not accessible');
     }
 
-    upsertEventsForGroups(calendar, validation, reportEntries);
+    upsertEventsForGroups(calendar, validation, reportEntries, calendarId);
 
     // Finally write the run report
     writeRunReport(ss, reportEntries);
+
+    // Show confirmation: which groups had events created and how many per group
+    showCreatedEventsSummary(reportEntries);
   } catch (e) {
     reportEntries.push(makeReportEntry({
       action: 'API_FAILURE',
@@ -74,6 +91,7 @@ function runSync() {
 
 var HEADER_EMAIL = 'Uczestnik (Email)';
 var HEADER_GROUP = 'Nazwa Grupy';
+var HEADER_CALENDAR_ID = 'Calendar ID';
 var HEADER_START_DATE = 'Data startu';
 var HEADER_END_DATE = 'Data końca';
 var HEADER_DAY1 = 'Dzień #1';
@@ -82,7 +100,7 @@ var HEADER_DAY2 = 'Dzień #2';
 var HEADER_TIME2 = 'Godzina #2 (hh:mm)';
 var HEADER_CONFIRMED = 'Confirmed';
 var HEADER_TRIAL_DATE = 'Data zajęć próbnych';
-var HEADER_ZOOM = 'Zoom link';
+var HEADER_ZOOM = 'Link zoom z bazy';
 var HEADER_TEACHER = 'Nauczyciel';
 var HEADER_DROPBOX = 'Link do dropbox';
 var HEADER_MIRO = 'Link do Miro';
@@ -115,6 +133,32 @@ function readScheduleRows(sheet) {
   return result;
 }
 
+function getCalendarIdFromSheet(sheet) {
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return null;
+
+  var headerRow = values[0];
+  var calendarColIndex = -1;
+
+  for (var c = 0; c < headerRow.length; c++) {
+    if (String(headerRow[c]) === HEADER_CALENDAR_ID) {
+      calendarColIndex = c;
+      break;
+    }
+  }
+
+  if (calendarColIndex === -1) return null;
+
+  for (var r = 1; r < values.length; r++) {
+    var cell = values[r][calendarColIndex];
+    if (cell !== '' && cell != null) {
+      return String(cell).trim();
+    }
+  }
+
+  return null;
+}
+
 function validateAndGroup(rawRows, reportEntries) {
   var validRows = [];
   var malformedRows = [];
@@ -141,7 +185,16 @@ function validateAndGroup(rawRows, reportEntries) {
 
   Object.keys(groupsByName).forEach(function(groupName) {
     var rows = groupsByName[groupName];
+    // Prefer a row that has a second slot defined (Dzień #2 / Godzina #2),
+    // so group schedule includes both slots when any row defines them.
     var first = rows[0];
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      if (r.day2 && r.time2) {
+        first = r;
+        break;
+      }
+    }
     var canonicalSchedule = buildGroupSchedule(first);
 
     var conflictingIndices = [];
@@ -194,7 +247,17 @@ function validateAndGroup(rawRows, reportEntries) {
 }
 
 function validateRow(raw) {
-  var v = function(h) { return raw.values[h]; };
+  // Flexible header lookup: tolerate non-breaking spaces and extra whitespace
+  var v = function(h) {
+    if (raw.values.hasOwnProperty(h)) return raw.values[h];
+    var target = String(h).replace(/\s+/g, ' ').trim();
+    for (var key in raw.values) {
+      if (!raw.values.hasOwnProperty(key)) continue;
+      var normKey = String(key).replace(/\s+/g, ' ').trim();
+      if (normKey === target) return raw.values[key];
+    }
+    return undefined;
+  };
 
   var emailRaw = v(HEADER_EMAIL);
   var groupRaw = v(HEADER_GROUP);
@@ -341,8 +404,32 @@ function validateRow(raw) {
 
 function parseWeekdayToken(value) {
   if (typeof value !== 'string') return null;
-  var t = value.trim();
-  if (['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].indexOf(t) !== -1) return t;
+  var raw = value.trim();
+  if (!raw) return null;
+
+  // Normalize common variants:
+  // - case-insensitive (tue, TUE)
+  // - with trailing punctuation (Tue.)
+  // - Polish abbreviations (Pn, Wt, Śr/Sr, Cz, Pt)
+  var t = raw.replace(/[.\s]+$/g, '').toLowerCase();
+
+  // English short
+  if (t.length >= 3) {
+    var first3 = t.slice(0, 3);
+    if (first3 === 'mon') return 'Mon';
+    if (first3 === 'tue') return 'Tue';
+    if (first3 === 'wed') return 'Wed';
+    if (first3 === 'thu') return 'Thu';
+    if (first3 === 'fri') return 'Fri';
+  }
+
+  // Polish short
+  if (t === 'pn') return 'Mon';
+  if (t === 'wt') return 'Tue';
+  if (t === 'sr' || t === 'śr') return 'Wed';
+  if (t === 'cz') return 'Thu';
+  if (t === 'pt') return 'Fri';
+
   return null;
 }
 
@@ -367,7 +454,8 @@ function parseTimeOfDay(value) {
 
   // Fallback: string in HH:mm
   if (typeof value === 'string') {
-    var m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+    // Accept "H:MM", "HH:MM", and also "H.MM" / "H,MM" (common in some locales)
+    var m = /^(\d{1,2})[:.,](\d{2})$/.exec(value.trim());
     if (!m) return null;
     var h2 = Number(m[1]);
     var mm2 = Number(m[2]);
@@ -388,6 +476,19 @@ function parseDateCell(value) {
     return d;
   }
   return null;
+}
+
+function endOfDay(date) {
+  var d = new Date(date.getTime());
+  d.setHours(23, 59, 59, 999);
+  return d;
+}
+
+function startOfNextDay(date) {
+  var d = new Date(date.getTime());
+  d.setDate(d.getDate() + 1);
+  d.setHours(0, 0, 0, 0);
+  return d;
 }
 
 function parseBooleanCell(value) {
@@ -452,22 +553,55 @@ var RAW_TEMPLATE = '' +
 '{{zoom link}}\n\n' +
 'Your teacher\'s name is {{Nauczyciel}}.\n' +
 'All lessons are recorded so you can rewatch them to review the material or in case you skipped one.\n\n' +
-'You can watch them here\n' +
 '{{to ma hyperlink do Dropbox}}\n\n' +
-'You will work with the miro board Classroom board\n' +
+'You will work with the miro board\n' +
 '{link do Miro}';
 
 function renderInvitationBody(row) {
   var body = RAW_TEMPLATE;
 
-  body = body.replace('{{zoom link}}', row.zoomLink || '');
+  function escapeHtmlText(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  // Escape values for safe inclusion into HTML attributes (Calendar description supports basic HTML).
+  function escapeHtmlAttribute(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function splitMultiLinks(cellValue) {
+    if (cellValue == null) return [];
+    if (typeof cellValue !== 'string') return [];
+    return cellValue
+      .split(/[\n,;]+/g)
+      .map(function(x) { return x.trim(); })
+      .filter(function(x) { return x.length > 0; });
+  }
+
+  function renderAnchors(cellValue, linkText) {
+    var links = splitMultiLinks(cellValue);
+    if (links.length === 0) return '';
+    return links.map(function(href, idx) {
+      var text = links.length > 1 ? (linkText + ' ' + (idx + 1)) : linkText;
+      return '<a href="' + escapeHtmlAttribute(href) + '">' + escapeHtmlText(text) + '</a>';
+    }).join('<br/>');
+  }
+
+  body = body.replace('{{zoom link}}', renderAnchors(row.zoomLink || '', 'Zoom link'));
   body = body.replace('{{Nauczyciel}}', row.teacherName || '');
 
-  var dropbox = row.dropboxLink || '';
-  var hyperlink = '<a href="' + dropbox + '">You can watch them here</a>';
-  body = body.replace('{{to ma hyperlink do Dropbox}}', hyperlink);
+  body = body.replace('{{to ma hyperlink do Dropbox}}',
+    renderAnchors(row.dropboxLink || '', 'You can watch them here'));
 
-  body = body.replace('{link do Miro}', row.miroLink || '');
+  body = body.replace('{link do Miro}', renderAnchors(row.miroLink || '', 'Classroom board'));
 
   return body;
 }
@@ -476,7 +610,29 @@ function renderInvitationBody(row) {
  * CALENDAR OPERATIONS (Phase 2)
  ******************************/
 
-function upsertEventsForGroups(calendar, validation, reportEntries) {
+/**
+ * Runs fn(); on "Service unavailable" or Calendar-related exception, retries up to
+ * CALENDAR_RETRY_ATTEMPTS with CALENDAR_RETRY_DELAY_MS between attempts.
+ */
+function runWithCalendarRetry(fn) {
+  var lastErr;
+  for (var attempt = 1; attempt <= CALENDAR_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return fn();
+    } catch (e) {
+      lastErr = e;
+      var msg = (e && e.message) ? String(e.message) : String(e);
+      if (attempt < CALENDAR_RETRY_ATTEMPTS && (msg.indexOf('Service unavailable') !== -1 || msg.indexOf('Calendar') !== -1)) {
+        Utilities.sleep(CALENDAR_RETRY_DELAY_MS);
+      } else {
+        throw e;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+function upsertEventsForGroups(calendar, validation, reportEntries, calendarId) {
   validation.validGroups.forEach(function(bucket) {
     var parts = partitionParticipants(bucket);
     var seriesParticipants = parts.seriesParticipants;
@@ -486,28 +642,121 @@ function upsertEventsForGroups(calendar, validation, reportEntries) {
     var canonicalRow = seriesParticipants[0] || bucket.rows[0];
     var description = renderInvitationBody(canonicalRow);
 
-    // BEH-11 config
-    if (seriesEmails.length === 0 && !CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES) {
+    var needSeries = seriesEmails.length > 0 || trialParticipants.length > 0 || CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES;
+    if (!needSeries) {
       reportEntries.push(makeReportEntry({
         action: 'GROUP_SKIPPED_NO_ATTENDEES',
         groupName: bucket.groupName,
         details: 'Group has no confirmed non-trial participants'
       }));
+      return;
+    }
+
+    var slots = bucket.schedule.slots;
+    if (slots.length < 2) {
+      reportEntries.push(makeReportEntry({
+        action: 'DEBUG_ONLY_ONE_SLOT',
+        groupName: bucket.groupName,
+        details: 'slots.length=' + slots.length + '; day1=' + (slots[0] ? slots[0].weekday : '') +
+          ' time1=' + (slots[0] ? (slots[0].time.hour + ':' + (slots[0].time.minute < 10 ? '0' : '') + slots[0].time.minute) : '')
+      }));
+    }
+
+    // Primary slot (Dzień #1 / Godzina #1)
+    var primarySlot = slots[0];
+    var existingSeriesPrimary = findExistingGroupSeriesForSlot(calendar, bucket, primarySlot) || findExistingGroupSeries(calendar, bucket);
+    var primarySeries;
+    if (existingSeriesPrimary) {
+      updateSeries(calendar, existingSeriesPrimary, bucket, primarySlot, seriesEmails, description, reportEntries);
+      primarySeries = existingSeriesPrimary;
     } else {
-      var existingSeries = findExistingGroupSeries(calendar, bucket);
-      if (existingSeries) {
-        updateSeries(calendar, existingSeries, bucket, seriesEmails, description, reportEntries);
+      primarySeries = createSeries(calendar, bucket, primarySlot, seriesEmails, description, reportEntries);
+    }
+
+    // Secondary slot (Dzień #2 / Godzina #2) if present
+    if (slots.length > 1 && slots[1] && slots[1].weekday && slots[1].time) {
+      var secondarySlot = slots[1];
+      var existingSeriesSecondary = findExistingGroupSeriesForSlot(calendar, bucket, secondarySlot);
+      if (existingSeriesSecondary) {
+        updateSeries(calendar, existingSeriesSecondary, bucket, secondarySlot, seriesEmails, description, reportEntries);
       } else {
-        createSeries(calendar, bucket, seriesEmails, description, reportEntries);
+        createSeries(calendar, bucket, secondarySlot, seriesEmails, description, reportEntries);
       }
     }
 
-    // Trial events
-    trialParticipants.forEach(function(row) {
-      if (!row.trialDate) return;
-      var desc = renderInvitationBody(row);
-      createTrialEvent(calendar, bucket, row, desc, reportEntries);
-    });
+    // Trial participants: attach to the correct series (slot) based on the trial date weekday
+    if (trialParticipants.length > 0) {
+      if (primarySeries && !existingSeriesPrimary) {
+        // Give API a moment to index newly created series
+        Utilities.sleep(1500);
+      }
+
+      trialParticipants.forEach(function(row) {
+        if (!row.trialDate) return;
+        var jsDay = row.trialDate.getDay(); // 0-6
+        var token = jsDayToToken(jsDay);
+        if (!token) {
+          reportEntries.push(makeReportEntry({
+            action: 'TRIAL_SLOT_NOT_FOUND',
+            groupName: bucket.groupName,
+            rowIndex: row.rowIndex,
+            details: 'Trial date weekday not supported for ' + row.participantEmail
+          }));
+          return;
+        }
+
+        // Find matching slot for this weekday
+        var matchingSlot = null;
+        for (var si = 0; si < slots.length; si++) {
+          var s = slots[si];
+          if (s && s.weekday === token) {
+            matchingSlot = s;
+            break;
+          }
+        }
+
+        if (!matchingSlot) {
+          reportEntries.push(makeReportEntry({
+            action: 'TRIAL_SLOT_NOT_FOUND',
+            groupName: bucket.groupName,
+            rowIndex: row.rowIndex,
+            details: 'No slot for weekday ' + token + ' for ' + row.participantEmail
+          }));
+          return;
+        }
+
+        var recurringEventIdForSlot = getRecurringEventIdForSlotByListing(
+          calendarId,
+          bucket.groupName,
+          matchingSlot,
+          bucket.schedule.startDate,
+          bucket.schedule.endDate
+        );
+
+        if (!recurringEventIdForSlot) {
+          reportEntries.push(makeReportEntry({
+            action: 'TRIAL_INSTANCE_NOT_FOUND',
+            groupName: bucket.groupName,
+            rowIndex: row.rowIndex,
+            details: 'No recurring series found for weekday ' + token +
+              ' and time ' + matchingSlot.time.hour + ':' + (matchingSlot.time.minute < 10 ? '0' : '') + matchingSlot.time.minute,
+            errorReason: 'No matching recurring series for slot'
+          }));
+          return;
+        }
+
+        addTrialGuestToInstance(
+          calendarId,
+          recurringEventIdForSlot,
+          row.trialDate,
+          row.participantEmail,
+          matchingSlot,
+          reportEntries,
+          bucket.groupName,
+          row.rowIndex
+        );
+      });
+    }
   });
 }
 
@@ -520,7 +769,7 @@ function partitionParticipants(bucket) {
       row.trialDate.getTime() >= bucket.schedule.startDate.getTime() &&
       row.trialDate.getTime() <= bucket.schedule.endDate.getTime();
 
-    if (hasTrial) {
+    if (hasTrial && row.confirmed) {
       trials.push(row);
     } else if (row.confirmed) {
       series.push(row);
@@ -544,30 +793,64 @@ function toAppsScriptWeekday(token) {
   }
 }
 
-function createSeries(calendar, bucket, emails, description, reportEntries) {
-  var schedule = bucket.schedule;
-  var primarySlot = schedule.slots[0];
+function jsWeekdayFromToken(token) {
+  // JS getDay(): Sun=0, Mon=1, ... Sat=6
+  switch (token) {
+    case 'Mon': return 1;
+    case 'Tue': return 2;
+    case 'Wed': return 3;
+    case 'Thu': return 4;
+    case 'Fri': return 5;
+    default:
+      throw new Error('Unsupported weekday token for alignment: ' + token);
+  }
+}
 
-  var start = new Date(schedule.startDate.getTime());
+function jsDayToToken(jsDay) {
+  // JS getDay(): Sun=0, Mon=1, ... Sat=6
+  switch (jsDay) {
+    case 1: return 'Mon';
+    case 2: return 'Tue';
+    case 3: return 'Wed';
+    case 4: return 'Thu';
+    case 5: return 'Fri';
+    default: return null;
+  }
+}
+
+function alignDateToWeekday(baseDate, weekdayToken) {
+  var targetDow = jsWeekdayFromToken(weekdayToken);
+  var d = new Date(baseDate.getTime());
+  var currentDow = d.getDay(); // 0–6
+  var delta = (targetDow - currentDow + 7) % 7; // 0–6 days forward
+  d.setDate(d.getDate() + delta);
+  return d;
+}
+
+function createSeries(calendar, bucket, slot, emails, description, reportEntries) {
+  var schedule = bucket.schedule;
+  var primarySlot = slot;
+
+  var alignedStartDate = alignDateToWeekday(schedule.startDate, primarySlot.weekday);
+  var start = new Date(alignedStartDate.getTime());
   start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
   var end = new Date(start.getTime() + 60 * 60 * 1000); // 1 hour
 
   var recurrence = CalendarApp.newRecurrence()
     .addWeeklyRule()
-    .until(schedule.endDate);
+    .until(startOfNextDay(schedule.endDate));
 
-  // Add all weekdays in slots
-  schedule.slots.forEach(function(s) {
-    recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
-  });
+  // Only this slot's weekday
+  recurrence.onlyOnWeekday(toAppsScriptWeekday(primarySlot.weekday));
+  recurrence.setTimeZone(Session.getScriptTimeZone());
 
-  var eventSeries = calendar.createEventSeries(bucket.groupName, start, end, recurrence, {
-    description: description
-  });
-
-  // Add attendees
-  emails.forEach(function(email) {
-    eventSeries.addGuest(email);
+  var eventSeries = runWithCalendarRetry(function() {
+    var series = calendar.createEventSeries(bucket.groupName, start, end, recurrence, {
+      description: description,
+      guests: emails.join(','),
+      sendInvites: false
+    });
+    return series;
   });
 
   reportEntries.push(makeReportEntry({
@@ -575,46 +858,46 @@ function createSeries(calendar, bucket, emails, description, reportEntries) {
     groupName: bucket.groupName,
     details: 'Created recurring event; attendees: ' + emails.length
   }));
+  return eventSeries;
 }
 
-function updateSeries(calendar, series, bucket, emails, description, reportEntries) {
+function updateSeries(calendar, series, bucket, slot, emails, description, reportEntries) {
   // Update description always (idempotent enough)
   series.setDescription(description);
 
   // Update recurrence if schedule changed: for simplicity, we always reset
   var schedule = bucket.schedule;
-  var primarySlot = schedule.slots[0];
-  var start = new Date(schedule.startDate.getTime());
+  var primarySlot = slot;
+  var alignedStartDate = alignDateToWeekday(schedule.startDate, primarySlot.weekday);
+  var start = new Date(alignedStartDate.getTime());
   start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
   var end = new Date(start.getTime() + 60 * 60 * 1000);
   var recurrence = CalendarApp.newRecurrence()
     .addWeeklyRule()
-    .until(schedule.endDate);
+    .until(startOfNextDay(schedule.endDate));
 
-  schedule.slots.forEach(function(s) {
-    recurrence.onlyOnWeekday(toAppsScriptWeekday(s.weekday));
-  });
+  recurrence.onlyOnWeekday(toAppsScriptWeekday(primarySlot.weekday));
+  recurrence.setTimeZone(Session.getScriptTimeZone());
 
-  series.setTime(start, end);
-  series.setRecurrence(recurrence);
+  runWithCalendarRetry(function() {
+    series.setTime(start, end);
+    series.setRecurrence(recurrence);
 
-  // Update guests
-  var currentGuests = series.getGuestList().map(function(g) { return g.getEmail(); });
-  var desired = {};
-  emails.forEach(function(e) { desired[e] = true; });
+    var currentGuests = series.getGuestList().map(function(g) { return g.getEmail(); });
+    var desired = {};
+    emails.forEach(function(e) { desired[e] = true; });
 
-  // Remove no-longer-confirmed
-  currentGuests.forEach(function(email) {
-    if (!desired[email]) {
-      series.removeGuest(email);
-    }
-  });
+    currentGuests.forEach(function(email) {
+      if (!desired[email]) {
+        series.removeGuest(email);
+      }
+    });
 
-  // Add newly confirmed
-  emails.forEach(function(email) {
-    if (currentGuests.indexOf(email) === -1) {
-      series.addGuest(email);
-    }
+    emails.forEach(function(email) {
+      if (currentGuests.indexOf(email) === -1) {
+        series.addGuest(email);
+      }
+    });
   });
 
   reportEntries.push(makeReportEntry({
@@ -646,25 +929,161 @@ function findExistingGroupSeries(calendar, bucket) {
   return null;
 }
 
-function createTrialEvent(calendar, bucket, row, description, reportEntries) {
+function findExistingGroupSeriesForSlot(calendar, bucket, slot) {
   var schedule = bucket.schedule;
-  var primarySlot = schedule.slots[0];
-  var start = new Date(row.trialDate.getTime());
-  start.setHours(primarySlot.time.hour, primarySlot.time.minute, 0, 0);
+  var startWindow = new Date(schedule.startDate.getTime());
+  startWindow.setDate(startWindow.getDate() - 7);
+  var endWindow = new Date(schedule.endDate.getTime());
+  endWindow.setDate(endWindow.getDate() + 7);
+
+  var desiredDow = jsWeekdayFromToken(slot.weekday);
+  var desiredHour = slot.time.hour;
+  var desiredMinute = slot.time.minute;
+
+  var events = calendar.getEvents(startWindow, endWindow);
+  for (var i = 0; i < events.length; i++) {
+    var e = events[i];
+    if (!e.isRecurringEvent()) continue;
+    if (e.getTitle() !== bucket.groupName) continue;
+
+    var eStart = e.getStartTime();
+    if (eStart < schedule.startDate || eStart > schedule.endDate) continue;
+    if (eStart.getDay() !== desiredDow) continue;
+    if (eStart.getHours() !== desiredHour || eStart.getMinutes() !== desiredMinute) continue;
+
+    return e.getEventSeries();
+  }
+  return null;
+}
+
+/**
+ * Returns the recurring event id for the series (for use with Calendar API instances/patch).
+ * CalendarEventSeries.getId() returns iCalUID; the API instances() endpoint needs the short event id.
+ * So we look up the recurring event by listing events in the schedule range and matching by title.
+ */
+function getRecurringEventIdFromSeries(series) {
+  try {
+    return series.getId();
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Gets the short recurring event id for a specific slot via Calendar API list.
+ * Filters by groupName, date window, weekday and time for the slot.
+ */
+function getRecurringEventIdForSlotByListing(calendarId, groupName, slot, startDate, endDate) {
+  try {
+    var startWindow = new Date(startDate.getTime());
+    startWindow.setDate(startWindow.getDate() - 7);
+    var endWindow = new Date(endDate.getTime());
+    endWindow.setDate(endWindow.getDate() + 7);
+
+    var timeMin = startWindow.toISOString();
+    var timeMax = startOfNextDay(endWindow).toISOString();
+
+    var desiredDow = jsWeekdayFromToken(slot.weekday);
+    var desiredHour = slot.time.hour;
+    var desiredMinute = slot.time.minute;
+
+    var response = Calendar.Events.list(calendarId, {
+      timeMin: timeMin,
+      timeMax: timeMax,
+      singleEvents: false
+    });
+    var items = response.items || [];
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (item.summary !== groupName) continue;
+      if (!item.recurrence) continue;
+
+      var startField = item.start && (item.start.dateTime || item.start.date);
+      if (!startField) continue;
+      var d = new Date(startField);
+      if (isNaN(d.getTime())) continue;
+
+      if (d.getDay() !== desiredDow) continue;
+
+      // If this is a timed event, also check the time of day
+      if (item.start.dateTime) {
+        if (d.getHours() !== desiredHour || d.getMinutes() !== desiredMinute) continue;
+      }
+
+      return item.id;
+    }
+  } catch (e) {
+    // fall through
+  }
+  return null;
+}
+
+/**
+ * Adds trial guest to the single occurrence on trialDate via Calendar API (per-slot).
+ * Requires Calendar Advanced Service (Google Calendar API) to be enabled.
+ */
+function addTrialGuestToInstance(calendarId, recurringEventId, trialDate, trialEmail, slot, reportEntries, groupName, rowIndex) {
+  var primarySlot = slot;
+  // Use calendar date (y/m/d) in script timezone so "2026-03-11" in sheet stays March 11, not March 10 UTC
+  var y = trialDate.getFullYear();
+  var m = trialDate.getMonth();
+  var d = trialDate.getDate();
+  var start = new Date(y, m, d, primarySlot.time.hour, primarySlot.time.minute, 0, 0);
   var end = new Date(start.getTime() + 60 * 60 * 1000);
+  var timeMin = start.toISOString();
+  var timeMax = end.toISOString();
+  var dateStr = y + '-' + (m + 1 < 10 ? '0' : '') + (m + 1) + '-' + (d < 10 ? '0' : '') + d;
 
-  var event = calendar.createEvent(bucket.groupName, start, end, {
-    description: description
-  });
-  event.addGuest(row.participantEmail);
-
-  reportEntries.push(makeReportEntry({
-    action: 'TRIAL_EVENT_CREATED',
-    groupName: bucket.groupName,
-    rowIndex: row.rowIndex,
-    details: 'Created trial event for ' + row.participantEmail +
-      ' on ' + row.trialDate.toISOString()
-  }));
+  try {
+    runWithCalendarRetry(function() {
+      var response = Calendar.Events.instances(calendarId, recurringEventId, {
+        timeMin: timeMin,
+        timeMax: timeMax
+      });
+      var items = response.items || [];
+      if (items.length === 0) {
+        reportEntries.push(makeReportEntry({
+          action: 'TRIAL_INSTANCE_NOT_FOUND',
+          groupName: groupName,
+          rowIndex: rowIndex,
+          details: 'No occurrence on ' + dateStr + ' for trial guest ' + trialEmail,
+          errorReason: 'Instance not in recurrence window or series not found'
+        }));
+        return;
+      }
+      var instance = items[0];
+      var attendees = instance.attendees || [];
+      var hasAlready = attendees.some(function(a) { return a.email === trialEmail; });
+      if (!hasAlready) {
+        attendees.push({ email: trialEmail });
+        var timeZone = Session.getScriptTimeZone();
+        var exceptionEvent = {
+          recurringEventId: recurringEventId,
+          originalStartTime: instance.originalStartTime || { dateTime: timeMin, timeZone: timeZone },
+          start: instance.start || { dateTime: timeMin, timeZone: timeZone },
+          end: instance.end || { dateTime: timeMax, timeZone: timeZone },
+          summary: instance.summary || groupName,
+          description: instance.description || '',
+          attendees: attendees
+        };
+        Calendar.Events.insert(exceptionEvent, calendarId, { sendUpdates: 'none' });
+      }
+      reportEntries.push(makeReportEntry({
+        action: 'TRIAL_GUEST_ADDED_TO_INSTANCE',
+        groupName: groupName,
+        rowIndex: rowIndex,
+        details: 'Added ' + trialEmail + ' to occurrence on ' + dateStr
+      }));
+    });
+  } catch (e) {
+    reportEntries.push(makeReportEntry({
+      action: 'TRIAL_GUEST_ADD_FAILED',
+      groupName: groupName,
+      rowIndex: rowIndex,
+      details: 'Failed to add trial guest ' + trialEmail + ' to instance on ' + dateStr,
+      errorReason: String(e)
+    }));
+  }
 }
 
 /******************************
@@ -680,6 +1099,53 @@ function makeReportEntry(fields) {
     details: fields.details || '',
     errorReason: fields.errorReason || ''
   };
+}
+
+/**
+ * Builds a map of groupName -> count of successfully created events from report entries.
+ * Only counts entries with action === 'EVENT_CREATED'.
+ */
+function getCreatedEventsByGroup(reportEntries) {
+  var createdByGroup = {};
+  reportEntries.forEach(function(e) {
+    if (e.action === 'EVENT_CREATED' && e.groupName) {
+      var name = String(e.groupName).trim();
+      if (name) {
+        createdByGroup[name] = (createdByGroup[name] || 0) + 1;
+      }
+    }
+  });
+  return createdByGroup;
+}
+
+/**
+ * Shows a popup alert summarizing which groups had calendar events created and how many per group.
+ * Safe to call when UI is unavailable (e.g. trigger); does nothing in that case.
+ */
+function showCreatedEventsSummary(reportEntries) {
+  try {
+    var ui = SpreadsheetApp.getUi();
+    if (!ui) return;
+
+    var createdByGroup = getCreatedEventsByGroup(reportEntries);
+    var groupNames = Object.keys(createdByGroup);
+    var message;
+
+    if (groupNames.length === 0) {
+      message = 'Nie utworzono żadnych nowych wydarzeń w kalendarzu.';
+    } else {
+      message = 'Utworzono wydarzenia w następujących grupach:\n\n';
+      groupNames.forEach(function(name) {
+        var count = createdByGroup[name];
+        var word = count === 1 ? 'wydarzenie' : (count >= 2 && count <= 4 ? 'wydarzenia' : 'wydarzeń');
+        message += '- ' + name + ': ' + count + ' ' + word + '\n';
+      });
+    }
+
+    ui.alert('Synchronizacja kalendarza', message, ui.ButtonSet.OK);
+  } catch (e) {
+    Logger.log('showCreatedEventsSummary: ' + (e && e.message ? e.message : String(e)));
+  }
 }
 
 function writeRunReport(ss, entries) {
@@ -714,8 +1180,9 @@ function writeRunReport(ss, entries) {
 
 function onOpen() {
   SpreadsheetApp.getUi()
-    .createMenu('Schedule Sync')
-    .addItem('Run sync now', 'runSync')
+    .createMenu('Zarządzanie wydarzeniami')
+    .addItem('Utwórz wydarzenia', 'runSync')
+    .addSeparator()
+    .addItem('Usuń wydarzenia', 'deleteEventsByGroup_1_1_withUi')
     .addToUi();
 }
-

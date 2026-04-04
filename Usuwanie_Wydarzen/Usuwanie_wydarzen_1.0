@@ -1,0 +1,406 @@
+/******************************
+ * CONFIG
+ ******************************/
+
+// Calendar id default (kept empty; main source is the sheet `Calendar ID` column)
+var CALENDAR_ID = '';
+
+// Sheet tab containing schedule (same as main script)
+var SCHEDULE_SHEET_NAME = 'Test_Schedule_Month_Script';
+
+// Where to write deletion audit
+var DELETE_REPORT_SHEET_NAME = 'Delete_Report';
+
+// Search buffer around schedule window when locating events
+var DELETE_WINDOW_BUFFER_DAYS = 7;
+
+/**
+ * Helper to force Apps Script to request Spreadsheet + Calendar scopes.
+ * Run once manually if needed.
+ */
+function authorizeDeleteTool_1_1() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+  if (!sheet) throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
+
+  var sheetCalendarId = getCalendarIdFromSheet_1_1(sheet);
+  var calendarId = sheetCalendarId || CALENDAR_ID;
+  if (!calendarId) {
+    throw new Error('Calendar ID is not configured. Please fill the \"Calendar ID\" column in sheet \"' +
+      SCHEDULE_SHEET_NAME + '\" or set CALENDAR_ID in the script.');
+  }
+
+  var calendar = CalendarApp.getCalendarById(calendarId);
+  if (!calendar) throw new Error('Calendar with id ' + calendarId + ' not found or not accessible');
+
+  // No-op reads to ensure access
+  ss.getName();
+  calendar.getName();
+}
+
+/******************************
+ * ENTRYPOINT (SCRIPT-ONLY)
+ ******************************/
+
+/**
+ * Script-only version:
+ * - Reads all groups from the schedule
+ * - Deletes events (series + single) for ALL groups
+ * - Writes audit into Delete_Report
+ *
+ * You can run this directly from the script editor.
+ */
+function deleteEventsByGroup_1_1() {
+  var ss = SpreadsheetApp.getActive();
+  var scheduleSheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+  if (!scheduleSheet) throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
+
+  var sheetCalendarId = getCalendarIdFromSheet_1_1(scheduleSheet);
+  var calendarId = sheetCalendarId || CALENDAR_ID;
+  if (!calendarId) {
+    throw new Error('Calendar ID is not configured. Please fill the \"Calendar ID\" column in sheet \"' +
+      SCHEDULE_SHEET_NAME + '\" or set CALENDAR_ID in the script.');
+  }
+
+  var groupInfo = buildGroupInfo_1_1(scheduleSheet); // { groupName: {startDate, endDate} }
+  var groupNames = Object.keys(groupInfo).sort();
+
+  if (groupNames.length === 0) {
+    Logger.log('No groups found in "' + SCHEDULE_SHEET_NAME + '". Nothing to delete.');
+    return;
+  }
+
+  Logger.log('Deleting events for ' + groupNames.length + ' group(s)...');
+  var result = handleDeleteGroups_1_1(groupNames, calendarId);
+  Logger.log('Done. See sheet "' + DELETE_REPORT_SHEET_NAME + '" for details.');
+  return result;
+}
+
+/**
+ * UI-assisted version:
+ * - Lets the user choose which groups to delete via a simple prompt
+ * - Input format: comma-separated group names, or * to delete ALL
+ * - Then calls handleDeleteGroups_1_1 with the selected group names
+ *
+ * Wire your menu to this function if you want interactive deletion:
+ *   .addItem('Delete group events…', 'deleteEventsByGroup_1_1_withUi')
+ */
+function deleteEventsByGroup_1_1_withUi() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActive();
+  var scheduleSheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+  if (!scheduleSheet) {
+    ui.alert('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found.');
+    return;
+  }
+
+  var groupInfo = buildGroupInfo_1_1(scheduleSheet);
+  var groupNames = Object.keys(groupInfo).sort();
+
+  if (groupNames.length === 0) {
+    ui.alert('No groups found in "' + SCHEDULE_SHEET_NAME + '".');
+    return;
+  }
+
+  // Build a short preview of available groups for the prompt message
+  var maxPreview = 15;
+  var previewNames = groupNames.slice(0, maxPreview);
+  var moreCount = groupNames.length - previewNames.length;
+  var messageLines = ['Available groups (first ' + previewNames.length + '):'];
+  previewNames.forEach(function(name) {
+    messageLines.push(' - ' + name);
+  });
+  if (moreCount > 0) {
+    messageLines.push(' ... and ' + moreCount + ' more');
+  }
+  messageLines.push('');
+  messageLines.push('Enter group names separated by commas, or * to delete ALL:');
+
+  var response = ui.prompt(
+    'Delete group events',
+    messageLines.join('\n'),
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) {
+    return; // User cancelled
+  }
+
+  var input = (response.getResponseText() || '').trim();
+  if (!input) {
+    ui.alert('No input provided. Nothing to delete.');
+    return;
+  }
+
+  var sheetCalendarId = getCalendarIdFromSheet_1_1(scheduleSheet);
+  var calendarId = sheetCalendarId || CALENDAR_ID;
+  if (!calendarId) {
+    ui.alert('Calendar ID is not configured. Please fill the \"Calendar ID\" column in sheet \"' +
+      SCHEDULE_SHEET_NAME + '\" or set CALENDAR_ID in the script.');
+    return;
+  }
+
+  var selectedGroupNames;
+  if (input === '*') {
+    selectedGroupNames = groupNames;
+  } else {
+    var rawNames = input.split(',');
+    selectedGroupNames = rawNames
+      .map(function(name) { return name.trim(); })
+      .filter(function(name) { return name; })
+      .filter(function(name) { return Object.prototype.hasOwnProperty.call(groupInfo, name); });
+
+    if (!selectedGroupNames.length) {
+      ui.alert('No valid group names provided. Nothing to delete.');
+      return;
+    }
+  }
+
+  // Confirm before deleting
+  var summary = selectedGroupNames.join(', ');
+  var confirm = ui.alert(
+    'Confirm deletion',
+    'You are about to delete events for:\n' + summary +
+      '\n\nThis cannot be undone. Continue?',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (confirm !== ui.Button.OK) {
+    return;
+  }
+
+  var result = handleDeleteGroups_1_1(selectedGroupNames, calendarId);
+
+  var totalSeries = 0;
+  var totalSingle = 0;
+  if (result && result.deleted && result.deleted.forEach) {
+    result.deleted.forEach(function(r) {
+      if (!r) return;
+      totalSeries += r.seriesDeletedCount || 0;
+      totalSingle += r.singleDeletedCount || 0;
+    });
+  }
+
+  ui.alert(
+    'Deletion complete',
+    'Deleted ' + totalSeries + ' recurring series and ' + totalSingle +
+      ' single events.\n\nSee sheet "' + DELETE_REPORT_SHEET_NAME + '" for details.',
+    ui.ButtonSet.OK
+  );
+
+  Logger.log(
+    'Deletion complete. Series: ' + totalSeries +
+    ', single events: ' + totalSingle +
+    '. See "' + DELETE_REPORT_SHEET_NAME + '" for details.'
+  );
+}
+
+/**
+ * Core deletion logic (same as in 1.0, but no HTML).
+ *
+ * Deletes all recurring series + all single events
+ * for each selected group within that group's schedule date range (+/- buffer),
+ * and writes an audit report.
+ */
+function handleDeleteGroups_1_1(selectedGroupNames, calendarId) {
+  if (!selectedGroupNames || !selectedGroupNames.length) {
+    return { ok: true, deleted: [] };
+  }
+
+  var ss = SpreadsheetApp.getActive();
+  var scheduleSheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+  if (!scheduleSheet) throw new Error('Schedule sheet "' + SCHEDULE_SHEET_NAME + '" not found');
+
+  var calendar = CalendarApp.getCalendarById(calendarId);
+  if (!calendar) throw new Error('Calendar with id ' + calendarId + ' not found or not accessible');
+
+  var groupInfo = buildGroupInfo_1_1(scheduleSheet);
+  var results = [];
+
+  selectedGroupNames.forEach(function(groupName) {
+    var info = groupInfo[groupName];
+    if (!info) {
+      results.push({ groupName: groupName, error: 'Group not found in schedule' });
+      return;
+    }
+
+    var startWindow = new Date(info.startDate.getTime());
+    startWindow.setDate(startWindow.getDate() - DELETE_WINDOW_BUFFER_DAYS);
+    var endWindow = new Date(info.endDate.getTime());
+    endWindow.setDate(endWindow.getDate() + DELETE_WINDOW_BUFFER_DAYS);
+
+    var events = calendar.getEvents(startWindow, endWindow);
+
+    var seriesDeletedById = {};
+    var seriesDeletedCount = 0;
+    var singleDeletedCount = 0;
+
+    events.forEach(function(e) {
+      if (e.getTitle() !== groupName) return;
+
+      if (e.isRecurringEvent()) {
+        // Multiple instances point to the same series; delete once.
+        var series = e.getEventSeries();
+        var seriesId = '';
+        try {
+          seriesId = series.getId();
+        } catch (err) {
+          seriesId = String(new Date().getTime()) + Math.random();
+        }
+        if (seriesDeletedById[seriesId]) return;
+        seriesDeletedById[seriesId] = true;
+        series.deleteEventSeries();
+        seriesDeletedCount++;
+      } else {
+        e.deleteEvent();
+        singleDeletedCount++;
+      }
+    });
+
+    results.push({
+      groupName: groupName,
+      startDate: info.startDate,
+      endDate: info.endDate,
+      seriesDeletedCount: seriesDeletedCount,
+      singleDeletedCount: singleDeletedCount
+    });
+  });
+
+  writeDeleteReport_1_1(ss, results);
+  return { ok: true, deleted: results };
+}
+
+/******************************
+ * SCHEDULE PARSING (minimal)
+ ******************************/
+
+var HEADER_GROUP_NAME_1_1 = 'Nazwa Grupy';
+var HEADER_START_DATE_1_1 = 'Data startu';
+var HEADER_END_DATE_1_1 = 'Data końca';
+var HEADER_CALENDAR_ID_1_1 = 'Calendar ID';
+
+function readScheduleRows_1_1(sheet) {
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  var headerRow = values[0];
+  var headers = headerRow.map(String);
+
+  var rows = [];
+  for (var i = 1; i < values.length; i++) {
+    var map = {};
+    for (var c = 0; c < headers.length; c++) {
+      map[headers[c]] = values[i][c];
+    }
+    rows.push({ rowIndex: i + 1, values: map });
+  }
+  return rows;
+}
+
+function getCalendarIdFromSheet_1_1(sheet) {
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return null;
+
+  var headerRow = values[0];
+  var calendarColIndex = -1;
+
+  for (var c = 0; c < headerRow.length; c++) {
+    if (String(headerRow[c]) === HEADER_CALENDAR_ID_1_1) {
+      calendarColIndex = c;
+      break;
+    }
+  }
+
+  if (calendarColIndex === -1) return null;
+
+  for (var r = 1; r < values.length; r++) {
+    var cell = values[r][calendarColIndex];
+    if (cell !== '' && cell != null) {
+      return String(cell).trim();
+    }
+  }
+
+  return null;
+}
+
+function valueByHeader_1_1(valuesMap, headerName) {
+  if (valuesMap.hasOwnProperty(headerName)) return valuesMap[headerName];
+  var target = String(headerName).replace(/\s+/g, ' ').trim();
+  for (var key in valuesMap) {
+    if (!valuesMap.hasOwnProperty(key)) continue;
+    var normKey = String(key).replace(/\s+/g, ' ').trim();
+    if (normKey === target) return valuesMap[key];
+  }
+  return undefined;
+}
+
+function parseDateCell_1_1(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return new Date(value.getTime());
+  }
+  if (typeof value === 'string') {
+    var d = new Date(value);
+    if (isNaN(d.getTime())) return null;
+    return d;
+  }
+  return null;
+}
+
+function buildGroupInfo_1_1(sheet) {
+  var rows = readScheduleRows_1_1(sheet);
+  var info = {};
+
+  rows.forEach(function(r) {
+    var groupName = valueByHeader_1_1(r.values, HEADER_GROUP_NAME_1_1);
+    if (!groupName) return;
+    groupName = String(groupName).trim();
+    if (!groupName) return;
+
+    var startRaw = valueByHeader_1_1(r.values, HEADER_START_DATE_1_1);
+    var endRaw = valueByHeader_1_1(r.values, HEADER_END_DATE_1_1);
+    var start = parseDateCell_1_1(startRaw);
+    var end = parseDateCell_1_1(endRaw);
+    if (!start || !end) return;
+
+    // Keep widest window across rows for the group
+    if (!info[groupName]) {
+      info[groupName] = { startDate: start, endDate: end };
+    } else {
+      if (start.getTime() < info[groupName].startDate.getTime()) {
+        info[groupName].startDate = start;
+      }
+      if (end.getTime() > info[groupName].endDate.getTime()) {
+        info[groupName].endDate = end;
+      }
+    }
+  });
+
+  return info;
+}
+
+/******************************
+ * REPORTING
+ ******************************/
+
+function writeDeleteReport_1_1(ss, results) {
+  var sheet = ss.getSheetByName(DELETE_REPORT_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(DELETE_REPORT_SHEET_NAME);
+
+  sheet.clearContents();
+  var header = ['Timestamp', 'GroupName', 'StartDate', 'EndDate', 'SeriesDeleted', 'SingleDeleted', 'Error'];
+  var rows = [header];
+
+  var ts = new Date();
+  results.forEach(function(r) {
+    rows.push([
+      ts,
+      r.groupName || '',
+      r.startDate || '',
+      r.endDate || '',
+      r.seriesDeletedCount || 0,
+      r.singleDeletedCount || 0,
+      r.error || ''
+    ]);
+  });
+
+  sheet.getRange(1, 1, rows.length, header.length).setValues(rows);
+}
