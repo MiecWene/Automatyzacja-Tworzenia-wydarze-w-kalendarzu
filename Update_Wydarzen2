@@ -1,0 +1,531 @@
+/******************************
+ * Update_Wydarzen — aktualizacja istniejących serii (bez tworzenia nowych)
+ *
+ * Wymaga w tym samym projekcie Apps Script pliku Automatyzacja_1.0
+ * (współdzielone funkcje i stałe: SCHEDULE_SHEET_NAME, readScheduleRows,
+ * validateAndGroup, partitionParticipants, renderInvitationBody,
+ * findExistingGroupSeries*, updateSeries, addTrialGuestToInstance, itd.).
+ *
+ * UI: tylko SpreadsheetApp.getUi() + arkusze Update_Preview / Update_Report
+ * (bez HtmlService).
+ ******************************/
+
+var UPDATE_PREVIEW_SHEET_NAME = 'Update_Preview';
+var UPDATE_REPORT_SHEET_NAME = 'Update_Report';
+
+/**
+ * Odczyt harmonogramu, podgląd zmian w arkuszu Update_Preview, potwierdzenie
+ * YES/NO, aktualizacja kalendarza i zapis Update_Report.
+ */
+function runScheduleUpdatesWithPreview() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActive();
+  var validationReport = [];
+
+  try {
+    var scheduleSheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+    if (!scheduleSheet) {
+      throw new Error('Brak arkusza "' + SCHEDULE_SHEET_NAME + '"');
+    }
+
+    var sheetCalendarId = getCalendarIdFromSheet(scheduleSheet);
+    var calendarId = sheetCalendarId || CALENDAR_ID;
+    if (!calendarId) {
+      throw new Error('Brak Calendar ID w arkuszu lub w CALENDAR_ID w skrypcie.');
+    }
+
+    var rawRows = readScheduleRows(scheduleSheet);
+    var validation = validateAndGroup(rawRows, validationReport);
+
+    var calendar = CalendarApp.getCalendarById(calendarId);
+    if (!calendar) {
+      throw new Error('Kalendarz niedostępny: ' + calendarId);
+    }
+
+    var plan = buildUpdatePlan_(calendar, validation);
+
+    writeUpdatePreview_(ss, plan.previewRows);
+
+    var msg =
+      'Podgląd zapisano w arkuszu "' +
+      UPDATE_PREVIEW_SHEET_NAME +
+      '".\n\n' +
+      'Grupy z zaplanowaną aktualizacją serii: ' +
+      plan.stats.groupsWithPlanned +
+      '\n' +
+      'Wierszy podglądu: ' +
+      plan.previewRows.length +
+      '\n\n' +
+      'Wykonać aktualizację kalendarza?';
+
+    var answer = ui.alert('Aktualizacja wydarzeń', msg, ui.ButtonSet.YES_NO);
+    if (answer !== ui.Button.YES) {
+      ui.alert('Aktualizacja wydarzeń', 'Anulowano — kalendarz bez zmian.', ui.ButtonSet.OK);
+      return;
+    }
+
+    var resultRows = [];
+    appendValidationRowsToReport_(validationReport, resultRows);
+    applyPlannedUpdates_(calendar, plan.planned, resultRows);
+    runTrialUpdatesForValidation_(calendar, calendarId, validation, resultRows);
+
+    writeUpdateReport_(ss, resultRows);
+
+    var summary = buildResultSummary_(resultRows, plan.planned.length);
+    ui.alert('Aktualizacja zakończona', summary, ui.ButtonSet.OK);
+  } catch (e) {
+    var errMsg = e && e.message ? e.message : String(e);
+    Logger.log('runScheduleUpdatesWithPreview: ' + errMsg + '\n' + (e.stack || ''));
+    try {
+      ui.alert('Błąd', errMsg, ui.ButtonSet.OK);
+    } catch (uiErr) {
+      Logger.log(uiErr);
+    }
+  }
+}
+
+/**
+ * Buduje plan: wiersze Update_Preview oraz listę { bucket, slot, series, ... } do apply.
+ */
+function buildUpdatePlan_(calendar, validation) {
+  var previewRows = [];
+  var planned = [];
+  var groupNamesPlanned = {};
+
+  validation.validGroups.forEach(function(bucket) {
+    var parts = partitionParticipants(bucket);
+    var seriesParticipants = parts.seriesParticipants;
+    var trialParticipants = parts.trialParticipants;
+    var seriesEmails = seriesParticipants.map(function(r) {
+      return r.participantEmail;
+    });
+
+    var needSeries =
+      seriesEmails.length > 0 ||
+      trialParticipants.length > 0 ||
+      CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES;
+
+    if (!needSeries) {
+      previewRows.push({
+        groupName: bucket.groupName,
+        slotLabel: '—',
+        changeType: 'SKIP_GROUP',
+        detail: 'Brak uczestników Confirmed (i brak próbnych w zakresie) — pominięto grupę.',
+        notes: ''
+      });
+      return;
+    }
+
+    var canonicalRow = seriesParticipants[0] || bucket.rows[0];
+    var description = renderInvitationBody(canonicalRow);
+    var slots = bucket.schedule.slots;
+
+    for (var si = 0; si < slots.length; si++) {
+      var slot = slots[si];
+      if (si === 1 && (!slot || !slot.weekday || !slot.time)) {
+        break;
+      }
+
+      var slotLabel = si === 0 ? 'Dzień #1' : 'Dzień #2';
+
+      var series = null;
+      if (si === 0) {
+        series =
+          findExistingGroupSeriesForSlot(calendar, bucket, slot) ||
+          findExistingGroupSeries(calendar, bucket);
+      } else {
+        series = findExistingGroupSeriesForSlot(calendar, bucket, slot);
+      }
+
+      if (!series) {
+        previewRows.push({
+          groupName: bucket.groupName,
+          slotLabel: slotLabel,
+          changeType: 'SKIP_NO_SERIES',
+          detail: 'Nie znaleziono istniejącej serii cyklicznej dla tego slotu — nie tworzono nowej.',
+          notes: ''
+        });
+        continue;
+      }
+
+      var diff = computeSeriesDiff_(calendar, bucket, slot, series, seriesEmails, description);
+
+      if (diff.guestsAdded.length === 0 &&
+          diff.guestsRemoved.length === 0 &&
+          !diff.descriptionChanged &&
+          !diff.scheduleChanged) {
+        previewRows.push({
+          groupName: bucket.groupName,
+          slotLabel: slotLabel,
+          changeType: 'NONE',
+          detail: 'Brak różnic względem arkusza.',
+          notes: ''
+        });
+        continue;
+      }
+
+      diff.guestsAdded.forEach(function(email) {
+        previewRows.push({
+          groupName: bucket.groupName,
+          slotLabel: slotLabel,
+          changeType: 'GUEST_ADD',
+          detail: email,
+          notes: ''
+        });
+      });
+      diff.guestsRemoved.forEach(function(email) {
+        previewRows.push({
+          groupName: bucket.groupName,
+          slotLabel: slotLabel,
+          changeType: 'GUEST_REMOVE',
+          detail: email,
+          notes: ''
+        });
+      });
+      if (diff.descriptionChanged) {
+        previewRows.push({
+          groupName: bucket.groupName,
+          slotLabel: slotLabel,
+          changeType: 'DESCRIPTION',
+          detail: 'Opis wydarzenia zostanie zaktualizowany.',
+          notes: ''
+        });
+      }
+      if (diff.scheduleChanged) {
+        previewRows.push({
+          groupName: bucket.groupName,
+          slotLabel: slotLabel,
+          changeType: 'TIME_OR_DAY',
+          detail: diff.scheduleDetail,
+          notes: ''
+        });
+      }
+
+      planned.push({
+        bucket: bucket,
+        slot: slot,
+        slotLabel: slotLabel,
+        series: series,
+        emails: seriesEmails,
+        description: description,
+        diffSummary: diff.summaryLine
+      });
+      groupNamesPlanned[bucket.groupName] = true;
+    }
+  });
+
+  return {
+    previewRows: previewRows,
+    planned: planned,
+    stats: {
+      groupsWithPlanned: Object.keys(groupNamesPlanned).length
+    }
+  };
+}
+
+function computeSeriesDiff_(calendar, bucket, slot, series, desiredEmails, desiredDescription) {
+  var curGuests = [];
+  try {
+    curGuests = series.getGuestList().map(function(g) {
+      return g.getEmail();
+    });
+  } catch (ignore) {
+    curGuests = [];
+  }
+  curGuests = curGuests.slice().sort();
+
+  var want = desiredEmails.slice().sort();
+  var curSet = {};
+  var wantSet = {};
+  curGuests.forEach(function(e) {
+    curSet[e] = true;
+  });
+  want.forEach(function(e) {
+    wantSet[e] = true;
+  });
+
+  var added = [];
+  var removed = [];
+  want.forEach(function(e) {
+    if (!curSet[e]) added.push(e);
+  });
+  curGuests.forEach(function(e) {
+    if (!wantSet[e]) removed.push(e);
+  });
+
+  var curDesc = '';
+  try {
+    curDesc = series.getDescription() || '';
+  } catch (ignore2) {
+    curDesc = '';
+  }
+  var descChanged = String(curDesc) !== String(desiredDescription);
+
+  var wantStart = desiredFirstOccurrenceStart_(bucket, slot);
+  var actualStart = getFirstOccurrenceStartInSeries_(calendar, series, bucket);
+  var scheduleChanged = false;
+  var scheduleDetail = '';
+
+  if (!actualStart) {
+    scheduleChanged = true;
+    scheduleDetail = 'Nie udało się odczytać pierwszego terminu z kalendarza — seria zostanie przebudowana wg arkusza.';
+  } else {
+    var delta = Math.abs(wantStart.getTime() - actualStart.getTime());
+    if (delta > 60000) {
+      scheduleChanged = true;
+      scheduleDetail =
+        'Termin (pierwsze wystąpienie): kalendarz ' +
+        formatDateTimeForUser_(actualStart) +
+        ' → arkusz ' +
+        formatDateTimeForUser_(wantStart);
+    }
+  }
+
+  var parts = [];
+  if (added.length) parts.push('Dodani goście: ' + added.join(', '));
+  if (removed.length) parts.push('Usunięci goście: ' + removed.join(', '));
+  if (descChanged) parts.push('Opis');
+  if (scheduleChanged) parts.push('Dzień/godzina/recurrence');
+
+  return {
+    guestsAdded: added,
+    guestsRemoved: removed,
+    descriptionChanged: descChanged,
+    scheduleChanged: scheduleChanged,
+    scheduleDetail: scheduleDetail,
+    summaryLine: parts.join(' | ') || 'Aktualizacja'
+  };
+}
+
+function desiredFirstOccurrenceStart_(bucket, slot) {
+  var aligned = alignDateToWeekday(bucket.schedule.startDate, slot.weekday);
+  var start = new Date(aligned.getTime());
+  start.setHours(slot.time.hour, slot.time.minute, 0, 0);
+  return start;
+}
+
+function getFirstOccurrenceStartInSeries_(calendar, series, bucket) {
+  var startWindow = new Date(bucket.schedule.startDate.getTime());
+  startWindow.setDate(startWindow.getDate() - 7);
+  var endWindow = new Date(bucket.schedule.endDate.getTime());
+  endWindow.setDate(endWindow.getDate() + 7);
+
+  var events = calendar.getEvents(startWindow, endWindow);
+  var sid = series.getId();
+  var best = null;
+
+  for (var i = 0; i < events.length; i++) {
+    var e = events[i];
+    if (!e.isRecurringEvent()) continue;
+    try {
+      if (e.getEventSeries().getId() !== sid) continue;
+    } catch (err) {
+      continue;
+    }
+    var st = e.getStartTime();
+    if (best === null || st.getTime() < best.getTime()) {
+      best = st;
+    }
+  }
+  return best;
+}
+
+function formatDateTimeForUser_(d) {
+  if (!d) return '';
+  var days = ['Nie', 'Pn', 'Wt', 'Śr', 'Cz', 'Pt', 'So'];
+  var dow = days[d.getDay()] || '';
+  var h = d.getHours();
+  var m = d.getMinutes();
+  var pad = function(n) {
+    return n < 10 ? '0' + n : String(n);
+  };
+  return dow + ' ' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(h) + ':' + pad(m);
+}
+
+function writeUpdatePreview_(ss, previewRows) {
+  var sheet = ss.getSheetByName(UPDATE_PREVIEW_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(UPDATE_PREVIEW_SHEET_NAME);
+  }
+  sheet.clearContents();
+
+  var header = ['GroupName', 'Slot', 'ChangeType', 'Detail', 'Notes'];
+  var rows = [header];
+  previewRows.forEach(function(p) {
+    rows.push([p.groupName, p.slotLabel, p.changeType, p.detail, p.notes || '']);
+  });
+
+  if (rows.length === 1) {
+    rows.push(['—', '—', 'INFO', 'Brak wierszy do wyświetlenia.', '']);
+  }
+
+  sheet.getRange(1, 1, rows.length, header.length).setValues(rows);
+}
+
+function appendValidationRowsToReport_(validationReport, resultRows) {
+  validationReport.forEach(function(e) {
+    resultRows.push([
+      e.timestamp,
+      e.groupName || '',
+      '',
+      e.action,
+      (e.details || '') +
+        (e.rowIndex !== '' && e.rowIndex != null ? ' [wiersz ' + e.rowIndex + ']' : ''),
+      e.errorReason || ''
+    ]);
+  });
+}
+
+function applyPlannedUpdates_(calendar, planned, resultRows) {
+  planned.forEach(function(item) {
+    try {
+      updateSeries(calendar, item.series, item.bucket, item.slot, item.emails, item.description, []);
+      resultRows.push([
+        new Date(),
+        item.bucket.groupName,
+        item.slotLabel,
+        'SERIES_UPDATED',
+        item.diffSummary,
+        ''
+      ]);
+    } catch (err) {
+      resultRows.push([
+        new Date(),
+        item.bucket.groupName,
+        item.slotLabel,
+        'UPDATE_FAILED',
+        item.diffSummary,
+        err && err.message ? String(err.message) : String(err)
+      ]);
+    }
+  });
+}
+
+/**
+ * Próbne — ta sama logika co w upsertEventsForGroups (bez tworzenia serii).
+ */
+function runTrialUpdatesForValidation_(calendar, calendarId, validation, resultRows) {
+  validation.validGroups.forEach(function(bucket) {
+    var parts = partitionParticipants(bucket);
+    var trialParticipants = parts.trialParticipants;
+    if (trialParticipants.length === 0) return;
+
+    var slots = bucket.schedule.slots;
+    var seriesParticipants = parts.seriesParticipants;
+    var seriesEmails = seriesParticipants.map(function(r) {
+      return r.participantEmail;
+    });
+    var needSeries =
+      seriesEmails.length > 0 ||
+      trialParticipants.length > 0 ||
+      CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES;
+    if (!needSeries) return;
+
+    trialParticipants.forEach(function(row) {
+      if (!row.trialDate) return;
+
+      var jsDay = row.trialDate.getDay();
+      var token = jsDayToToken(jsDay);
+      if (!token) {
+        pushTrialReportRow_(resultRows, bucket.groupName, 'TRIAL_SLOT_NOT_FOUND', row, 'Nieobsługowany dzień tygodnia');
+        return;
+      }
+
+      var matchingSlot = null;
+      for (var si = 0; si < slots.length; si++) {
+        var s = slots[si];
+        if (s && s.weekday === token) {
+          matchingSlot = s;
+          break;
+        }
+      }
+      if (!matchingSlot) {
+        pushTrialReportRow_(resultRows, bucket.groupName, 'TRIAL_SLOT_NOT_FOUND', row, 'Brak slotu dla dnia ' + token);
+        return;
+      }
+
+      var recurringEventIdForSlot = getRecurringEventIdForSlotByListing(
+        calendarId,
+        bucket.groupName,
+        matchingSlot,
+        bucket.schedule.startDate,
+        bucket.schedule.endDate
+      );
+
+      if (!recurringEventIdForSlot) {
+        pushTrialReportRow_(
+          resultRows,
+          bucket.groupName,
+          'TRIAL_SERIES_NOT_FOUND',
+          row,
+          'Brak serii cyklicznej dla slotu (próbne nie dodane).'
+        );
+        return;
+      }
+
+      var trialRep = [];
+      addTrialGuestToInstance(
+        calendarId,
+        recurringEventIdForSlot,
+        row.trialDate,
+        row.participantEmail,
+        matchingSlot,
+        trialRep,
+        bucket.groupName,
+        row.rowIndex
+      );
+      trialRep.forEach(function(e) {
+        resultRows.push([
+          e.timestamp,
+          e.groupName || bucket.groupName,
+          'próbne',
+          e.action,
+          e.details || '',
+          e.errorReason || ''
+        ]);
+      });
+    });
+  });
+}
+
+function pushTrialReportRow_(resultRows, groupName, action, row, details) {
+  resultRows.push([new Date(), groupName, 'próbne', action, details, 'wiersz ' + row.rowIndex]);
+}
+
+function writeUpdateReport_(ss, resultRows) {
+  var sheet = ss.getSheetByName(UPDATE_REPORT_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(UPDATE_REPORT_SHEET_NAME);
+  }
+  sheet.clearContents();
+
+  var header = ['Timestamp', 'GroupName', 'Slot', 'Action', 'Details', 'ErrorReason'];
+  var rows = [header];
+  resultRows.forEach(function(r) {
+    rows.push(r);
+  });
+
+  sheet.getRange(1, 1, rows.length, header.length).setValues(rows);
+}
+
+function buildResultSummary_(resultRows, plannedCount) {
+  var updated = 0;
+  var failed = 0;
+  var trialAdded = 0;
+
+  for (var i = 0; i < resultRows.length; i++) {
+    var a = resultRows[i][3];
+    if (a === 'SERIES_UPDATED') updated++;
+    if (a === 'UPDATE_FAILED') failed++;
+    if (a === 'TRIAL_GUEST_ADDED_TO_INSTANCE') trialAdded++;
+  }
+
+  var lines = [];
+  lines.push('Zaplanowanych aktualizacji serii: ' + plannedCount);
+  lines.push('Wykonanych aktualizacji serii: ' + updated);
+  if (failed > 0) lines.push('Nieudanych: ' + failed);
+  if (trialAdded > 0) lines.push('Dodanych gości próbnych (wystąpienie): ' + trialAdded);
+  lines.push('');
+  lines.push('Pełny log: arkusz "' + UPDATE_REPORT_SHEET_NAME + '".');
+  return lines.join('\n');
+}

@@ -1182,6 +1182,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Zarządzanie wydarzeniami')
     .addItem('Utwórz wydarzenia', 'runSync')
+    .addItem('Aktualizuj wydarzenia (podgląd)…', 'runScheduleUpdatesWithPreview')
     .addSeparator()
     .addItem('Usuń wydarzenia', 'deleteEventsByGroup_1_1_withUi')
     .addToUi();
