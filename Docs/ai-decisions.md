@@ -1069,3 +1069,46 @@ Across all versions, the **core invariant** is preserved: for each chosen group 
 **Files affected**:
 - `Automatyzacja_1.0` – `RAW_TEMPLATE` / `renderInvitationBody()` for Miro link rendering.
 
+---
+
+## Entry – 04.04.2026
+
+**Context**: Users wanted to **update** existing Google Calendar recurring series from the same schedule sheet as `Automatyzacja_1.0`, but **without** running the full create/update upsert (`runSync`) as the only path. The flow should respect **Confirmed = True** for who counts toward series/trial handling, match events by **group name** (`Nazwa Grupy`) like the main script, show what will change and what did change, and avoid **HtmlService** (only `SpreadsheetApp.getUi()` plus sheet-based detail).
+
+**Goal**: A separate Apps Script module that:
+
+- Reads `Schedule_Month_Script` and uses the same validation/grouping and participant rules as the main automation (`validateAndGroup`, `partitionParticipants`, `CREATE_EVENTS_WITH_NO_CONFIRMED_ATTENDEES`).
+- Resolves **Calendar ID** from the sheet (or `CALENDAR_ID` fallback), same as `runSync`.
+- **Never creates** new recurring series: if no matching series exists for a slot, log **SKIP_NO_SERIES** and skip (unlike `upsertEventsForGroups`, which calls `createSeries`).
+- For each located series, detects diffs vs the sheet and calls existing **`updateSeries`** (description, recurrence/time/day via `setRecurrence`, guest add/remove).
+- Surfaces **preview** on an **`Update_Preview`** tab and **audit/results** on **`Update_Report`**; uses short **`getUi().alert`** summaries and **YES/NO** confirmation before writing to Calendar.
+- Reuses **trial** behaviour: `getRecurringEventIdForSlotByListing` + `addTrialGuestToInstance` when a confirmed trial row exists and the recurring series for that slot exists.
+
+**UI decision (no HtmlService)**:
+
+- Long or structured lists belong on **`Update_Preview`** (before run) and **`Update_Report`** (after run), not in dialog text (alerts truncate).
+- Confirmation: `SpreadsheetApp.getUi().alert(..., ButtonSet.YES_NO)` after the preview sheet is written; cancel path shows a titled alert and exits without calendar writes.
+- Aligns with the pattern used for reliable server-side UI in **`Usuwanie_wydarzen_1.1_withUi`** (no iframe / `google.script.run` for this feature).
+
+**Matching and diff logic**:
+
+- **Primary slot (Dzień #1)**: `findExistingGroupSeriesForSlot` **or** fallback `findExistingGroupSeries` so a **change of weekday/time in the sheet** can still find the old primary series (same approach as `upsertEventsForGroups`).
+- **Secondary slot (Dzień #2)**: only `findExistingGroupSeriesForSlot` — if the secondary slot’s day/time in the sheet no longer matches the calendar, the updater may not find the series (same structural limitation as the main script for secondary-only moves).
+- **Diffs computed before apply**: guest emails (sorted sets), description string equality, and **first occurrence start** in the calendar vs **sheet-derived** `alignDateToWeekday` + slot time; **> 1 minute** delta counts as a schedule change. **Pure `Data końca` / recurrence UNTIL** changes may **not** appear as a schedule diff if the first occurrence time is unchanged (acceptable v1 tradeoff; full RRULE comparison could be a follow-up).
+- **`updateSeries`** is still invoked with an empty report array from this module; results are logged manually to **`Update_Report`** as `SERIES_UPDATED` / `UPDATE_FAILED` with a human-readable `diffSummary` line.
+
+**Trial caveat**:
+
+- **`addTrialGuestToInstance`** adds guests on a single occurrence; **removing** a trial guest when Confirmed becomes false is **not** covered by the same helper — treat as future work if needed.
+
+**Menu integration**:
+
+- **`onOpen`** in `Automatyzacja_1.0`: add menu item **“Aktualizuj wydarzenia (podgląd)…”** → `runScheduleUpdatesWithPreview`.
+
+**Files affected**:
+
+- **`Update_Wydarzen`** (repo file; add as a second script file in the same Apps Script project as `Automatyzacja_1.0` so shared globals resolve).
+- **`Automatyzacja_1.0`** – `onOpen` menu entry only.
+
+**Result**: Operators can refresh calendar content (guests, description, day/time/recurrence for matched series) from the sheet with an explicit sheet-backed preview and post-run audit, without HtmlService and without accidental creation of new series from the update entrypoint.
+
